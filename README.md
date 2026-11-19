@@ -140,6 +140,8 @@ continue in the background until its current operation returns; its clip is
 discarded and not added to review. Nothing is uploaded until you click an upload
 action. YouTube uploads default to **private**; choose unlisted or public
 explicitly in the review page if desired.
+The dashboard also shows progress while monitoring and while a clip is being
+cut, transcribed, rendered, and prepared for review.
 
 To enable YouTube uploads, create a Google Cloud project, enable the YouTube
 Data API v3, and create an OAuth client ID for a Desktop app. Download its JSON

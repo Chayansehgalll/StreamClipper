@@ -1376,8 +1376,15 @@ class ClipPipeline:
         self.voice_separator = voice_separator or VoiceStemSeparator()
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_CLIPS)
 
-    async def create_clip(self) -> None:
+    async def create_clip(
+        self,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
         async with self.semaphore:
+            def report_progress(message: str) -> None:
+                if progress_callback is not None:
+                    progress_callback(message)
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             stem = f"clip_{safe_stem(self.channel)}_{timestamp}"
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1390,14 +1397,17 @@ class ClipPipeline:
             clip_completed = False
 
             try:
+                report_progress("Cutting a clip from the stream buffer…")
                 await self.capture.create_raw_clip(raw_clip)
                 if VOICE_ONLY_AUDIO:
+                    report_progress("Separating audio…")
                     LOGGER.info("Separating a local vocal stem; this may take several minutes.")
                     voice_audio = await self.voice_separator.isolate(raw_clip, stem)
                 if VOICE_ONLY_AUDIO and voice_audio is None:
                     words, transcript = [], ""
                 else:
                     transcription_audio = voice_audio or raw_clip
+                    report_progress("Transcribing speech…")
                     words, transcript = await self.transcriber.transcribe(transcription_audio)
                 subtitle_text = format_subtitles(words)
                 if not subtitle_text:
@@ -1409,6 +1419,7 @@ class ClipPipeline:
                     subtitle_file.write_text(subtitle_text, encoding="utf-8")
                     subtitle_argument = subtitle_file
 
+                report_progress("Rendering the vertical clip…")
                 await render_vertical(
                     raw_clip,
                     subtitle_argument,
@@ -1425,9 +1436,11 @@ class ClipPipeline:
                     "transcript": transcript,
                 }
                 if transcript.strip():
+                    report_progress("Generating title and description…")
                     metadata.update(await self.metadata.generate(transcript, self.channel))
                 else:
                     LOGGER.warning("Skipping Groq metadata because no speech transcript was detected.")
+                report_progress("Saving the completed clip…")
                 temporary_metadata = metadata_file.with_suffix(".json.tmp")
                 temporary_metadata.write_text(
                     json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -1436,6 +1449,7 @@ class ClipPipeline:
                 temporary_metadata.replace(metadata_file)
                 LOGGER.info("Created clip: %s", final_file)
                 clip_completed = True
+                report_progress("Clip is ready for review.")
             except Exception:
                 LOGGER.exception("Clip processing failed for %s.", stem)
                 raise
@@ -1461,6 +1475,7 @@ async def monitor_chat(
     capture: RollingStreamCapture,
     settings: ClipSettings | None = None,
     stop_event: asyncio.Event | None = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> None:
     settings = settings or ClipSettings(
         stream_url=getattr(reader, "url", ""),
@@ -1486,6 +1501,26 @@ async def monitor_chat(
     clips_started = 0
     buffer_wait_logged = False
     tasks: set[asyncio.Task[None]] = set()
+    active_clip_progress: dict[int, str] = {}
+
+    def publish_progress(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+
+    def publish_clip_progress() -> None:
+        if stop_event is not None and stop_event.is_set():
+            return
+        if active_clip_progress:
+            publish_progress(
+                " | ".join(
+                    f"Clip {number}: {message}"
+                    for number, message in sorted(active_clip_progress.items())
+                )
+            )
+        elif clips_started >= settings.max_clips:
+            publish_progress("Finishing the configured clip run…")
+        else:
+            publish_progress("Watching chat for a fast-activity spike…")
 
     def completed(task: asyncio.Task[None]) -> None:
         tasks.discard(task)
@@ -1511,6 +1546,7 @@ async def monitor_chat(
         return event_task.result()
 
     reader.start()
+    publish_progress("Watching chat for a fast-activity spike…")
     LOGGER.info(
         "Watching chat for fast activity: trigger at %.1fx usual rate or at least "
         "%d messages in %ds; clips are %ds total with %ds before the spike; "
@@ -1585,27 +1621,68 @@ async def monitor_chat(
                             "Building the %d-second stream buffer; clips can start once it is ready.",
                             settings.clip_duration,
                         )
+                        publish_progress("Building the initial stream buffer…")
                         buffer_wait_logged = True
                     continue
                 if buffer_wait_logged:
                     LOGGER.info("Stream buffer is ready; automatic clipping is active.")
                     buffer_wait_logged = False
 
+                clip_number = clips_started + 1
+                wait_seconds = settings.clip_duration - settings.clip_pre_roll_seconds
+                active_clip_progress[clip_number] = (
+                    f"Chat spike found; capturing {wait_seconds}s more…"
+                )
+                publish_clip_progress()
+
                 async def create_spike_clip() -> None:
-                    wait_seconds = settings.clip_duration - settings.clip_pre_roll_seconds
-                    if stop_event is None:
-                        await asyncio.sleep(wait_seconds)
-                    else:
-                        try:
-                            await asyncio.wait_for(
-                                stop_event.wait(),
-                                timeout=wait_seconds,
-                            )
-                        except asyncio.TimeoutError:
-                            pass
-                        if stop_event.is_set():
+                    try:
+                        if progress_callback is None:
+                            if stop_event is None:
+                                await asyncio.sleep(wait_seconds)
+                            else:
+                                try:
+                                    await asyncio.wait_for(
+                                        stop_event.wait(),
+                                        timeout=wait_seconds,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                        else:
+                            deadline = asyncio.get_running_loop().time() + wait_seconds
+                            while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+                                active_clip_progress[clip_number] = (
+                                    f"Chat spike found; capturing "
+                                    f"{math.ceil(remaining)}s more…"
+                                )
+                                publish_clip_progress()
+                                timeout = min(remaining, 1.0)
+                                if stop_event is None:
+                                    await asyncio.sleep(timeout)
+                                else:
+                                    try:
+                                        await asyncio.wait_for(
+                                            stop_event.wait(),
+                                            timeout=timeout,
+                                        )
+                                    except asyncio.TimeoutError:
+                                        pass
+                                    if stop_event.is_set():
+                                        return
+                        if stop_event is not None and stop_event.is_set():
                             return
-                    await pipeline.create_clip()
+                        if progress_callback is None:
+                            await pipeline.create_clip()
+                        else:
+                            def update_clip_progress(message: str) -> None:
+                                active_clip_progress[clip_number] = message
+                                publish_clip_progress()
+
+                            await pipeline.create_clip(update_clip_progress)
+                            publish_clip_progress()
+                    finally:
+                        active_clip_progress.pop(clip_number, None)
+                        publish_clip_progress()
 
                 last_trigger = now
                 spike_active = True
@@ -1675,7 +1752,11 @@ def validate_runtime_dependencies() -> None:
         )
 
 
-async def run_clip_session(settings: ClipSettings, stop_event: asyncio.Event) -> None:
+async def run_clip_session(
+    settings: ClipSettings,
+    stop_event: asyncio.Event,
+    progress_callback: Callable[[str], None] | None = None,
+) -> None:
     url = settings.stream_url
     if "://" not in url:
         url = f"https://{url}"
@@ -1694,7 +1775,14 @@ async def run_clip_session(settings: ClipSettings, stop_event: asyncio.Event) ->
     )
     capture_task = asyncio.create_task(capture.run(), name="stream-capture")
     try:
-        await monitor_chat(reader, pipeline, capture, settings, stop_event)
+        await monitor_chat(
+            reader,
+            pipeline,
+            capture,
+            settings,
+            stop_event,
+            progress_callback,
+        )
     finally:
         reader.stop()
         capture.stop()
@@ -1709,7 +1797,12 @@ class ClipperController:
         self._lock = threading.Lock()
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
-        self._state: dict[str, Any] = {"status": "idle", "stream_url": "", "error": ""}
+        self._state: dict[str, Any] = {
+            "status": "idle",
+            "stream_url": "",
+            "error": "",
+            "progress": "",
+        }
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -1734,6 +1827,7 @@ class ClipperController:
                 "stream_url": settings.stream_url,
                 "settings": asdict(settings),
                 "error": "",
+                "progress": "Starting the clipper…",
             }
         self._task = asyncio.create_task(
             self._run(settings, self._stop_event),
@@ -1743,22 +1837,33 @@ class ClipperController:
 
     async def _run(self, settings: ClipSettings, stop_event: asyncio.Event) -> None:
         try:
+            self._set_progress("Checking required tools…")
             validate_runtime_dependencies()
             if stop_event.is_set():
                 with self._lock:
                     self._state["status"] = "stopped"
+                    self._state["progress"] = "Stopped."
                 return
             with self._lock:
                 self._state["status"] = "observing"
-            await run_clip_session(settings, stop_event)
+            self._set_progress("Connecting to the stream…")
+            await run_clip_session(settings, stop_event, self._set_progress)
             final_status = "stopped" if stop_event.is_set() else "completed"
             with self._lock:
                 self._state["status"] = final_status
+                self._state["progress"] = (
+                    "Stopped." if final_status == "stopped" else "Run complete."
+                )
         except Exception as exc:
             LOGGER.exception("Clipper session failed.")
             with self._lock:
                 self._state["status"] = "error"
                 self._state["error"] = str(exc)
+
+    def _set_progress(self, message: str) -> None:
+        with self._lock:
+            if self._state.get("status") in {"starting", "observing"}:
+                self._state["progress"] = message
 
     def stop(self) -> dict[str, Any]:
         future = asyncio.run_coroutine_threadsafe(self._request_stop(), self.loop)
@@ -1773,6 +1878,7 @@ class ClipperController:
             return {"ok": True, "status": self.status()["status"]}
         with self._lock:
             self._state["status"] = "stopping"
+            self._state["progress"] = "Stopping and discarding the current clip…"
         if self._stop_event is not None:
             self._stop_event.set()
         return {"ok": True, "status": "stopping"}

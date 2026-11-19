@@ -11,6 +11,7 @@ import mimetypes
 import re
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -220,15 +221,18 @@ class ClipReviewServer:
                         f"bytes {start}-{end}/{file_size}",
                     )
                 self.end_headers()
-                with path.open("rb") as media_file:
-                    media_file.seek(start)
-                    remaining = content_length
-                    while remaining:
-                        chunk = media_file.read(min(64 * 1024, remaining))
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        remaining -= len(chunk)
+                try:
+                    with path.open("rb") as media_file:
+                        media_file.seek(start)
+                        remaining = content_length
+                        while remaining:
+                            chunk = media_file.read(min(64 * 1024, remaining))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    LOGGER.debug("Media request ended before transfer completed: %s", path.name)
 
         self.server = ThreadingHTTPServer((host, port), RequestHandler)
         self.server.daemon_threads = True
@@ -283,7 +287,7 @@ class ClipReviewServer:
 
     def _control_status(self) -> dict[str, Any]:
         if self.controller is None:
-            return {"status": "idle", "stream_url": "", "error": ""}
+            return {"status": "idle", "stream_url": "", "error": "", "progress": ""}
         return self.controller.status()
 
     def _start_monitoring(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -401,7 +405,7 @@ class ClipReviewServer:
                 metadata_path,
             ):
                 if path.is_file():
-                    path.unlink()
+                    self._unlink_local_file(path)
         LOGGER.info(
             "Deleted local clip %s; YouTube upload retained=%s.",
             clip_id,
@@ -412,6 +416,23 @@ class ClipReviewServer:
             "clip_id": clip_id,
             "youtube_upload_retained": youtube_upload_retained,
         }
+
+    @staticmethod
+    def _unlink_local_file(path: Path) -> None:
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                path.unlink()
+                return
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in {32, 33}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "The clip file is still in use. Close its preview or other "
+                        "app playing it, then try deleting again."
+                    ) from exc
+                time.sleep(0.1)
 
     def _upload_to_youtube(self, payload: dict[str, Any]) -> dict[str, Any]:
         clip_id = payload.get("clip_id")
@@ -567,7 +588,7 @@ button.primary{background:#2563eb}button.instagram{background:#be185d}button.dan
   <section id="active" class="card" hidden>
     <h2>Monitoring stream</h2>
     <p id="active-stream"></p>
-    <p id="active-message" class="status">Starting…</p>
+    <p id="active-message" class="status" aria-live="polite">Starting…</p>
     <button id="stop" class="danger" type="button">Stop clipping</button>
   </section>
   <h2>Review completed clips</h2>
@@ -624,7 +645,7 @@ async function updateStatus(){
     if(["starting","observing","stopping"].includes(state.status)){
       setup.hidden=true;active.hidden=false;
       document.querySelector("#active-stream").textContent=state.stream_url||"";
-      document.querySelector("#active-message").textContent=state.status==="error"?state.error:name;
+      document.querySelector("#active-message").textContent=state.progress||name;
       document.querySelector("#stop").disabled=state.status==="stopping";
     }else{
       active.hidden=true;setup.hidden=false;
@@ -693,6 +714,7 @@ async function loadClips(){
       const deleteButton=button("Delete clip","danger",async()=>{
         if(!confirm("Delete this clip's local video, subtitle, and metadata files? Any YouTube upload will remain online."))return;
         deleteButton.disabled=true;status.textContent="Deleting local files…";
+        video.pause();video.removeAttribute("src");video.load();
         try{
           const result=await post("/api/delete",{clip_id:clip.id});
           const notice=document.createElement("p");notice.className="status";
@@ -700,7 +722,10 @@ async function loadClips(){
             ?"Local clip deleted. Its YouTube upload remains online."
             :"Local clip deleted.";
           card.replaceWith(notice);
-        }catch(error){status.textContent=error.message;deleteButton.disabled=false;}
+        }catch(error){
+          video.src=clip.video_url;video.load();
+          status.textContent=error.message;deleteButton.disabled=false;
+        }
       });
       actions.append(uploadButton,button("Prepare Instagram manual upload","instagram",async()=>{
         const caption=[description.value,hashtags.value].filter(Boolean).join("\n\n");

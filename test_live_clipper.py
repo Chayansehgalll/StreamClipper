@@ -95,8 +95,9 @@ class ClipperControllerTests(unittest.IsolatedAsyncioTestCase):
         settings = ClipSettings(stream_url="https://www.twitch.tv/example")
         started = asyncio.Event()
 
-        async def fake_session(session_settings, stop_event):
+        async def fake_session(session_settings, stop_event, progress_callback):
             self.assertEqual(session_settings, settings)
+            progress_callback("Cutting the clip…")
             started.set()
             await stop_event.wait()
 
@@ -107,6 +108,7 @@ class ClipperControllerTests(unittest.IsolatedAsyncioTestCase):
             result = await controller._start(settings)
             self.assertEqual(result["status"], "starting")
             await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertEqual(controller.status()["progress"], "Cutting the clip…")
             stop_result = await asyncio.to_thread(controller.stop)
             self.assertEqual(stop_result["status"], "stopping")
             await asyncio.wait_for(controller._task, timeout=1)
@@ -539,9 +541,27 @@ class ClipReviewServerTests(unittest.TestCase):
                         "X-Review-Token": server._token,
                     },
                 )
-                with urlopen(request) as response:
-                    result = json.loads(response.read())
+                original_unlink = Path.unlink
+                lock_failures = 0
 
+                class LockedFileError(PermissionError):
+                    winerror = 32
+
+                def unlink_with_temporary_lock(path, *args, **kwargs):
+                    nonlocal lock_failures
+                    if path == video_path and lock_failures == 0:
+                        lock_failures += 1
+                        raise LockedFileError("The file is temporarily in use.")
+                    return original_unlink(path, *args, **kwargs)
+
+                with (
+                    patch("review_server.time.sleep"),
+                    patch.object(Path, "unlink", unlink_with_temporary_lock),
+                ):
+                    with urlopen(request) as response:
+                        result = json.loads(response.read())
+
+                self.assertEqual(lock_failures, 1)
                 self.assertTrue(result["ok"])
                 self.assertTrue(result["youtube_upload_retained"])
                 self.assertFalse(video_path.exists())
@@ -718,7 +738,9 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
                 self.started = asyncio.Event()
                 self.cancelled = False
 
-            async def create_clip(self):
+            async def create_clip(self, progress_callback=None):
+                if progress_callback is not None:
+                    progress_callback("Cutting the clip…")
                 self.started.set()
                 try:
                     await asyncio.Future()
@@ -730,6 +752,7 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
         capture = FakeCapture()
         pipeline = FakePipeline()
         stop_event = asyncio.Event()
+        progress_messages = []
         settings = ClipSettings(
             stream_url="https://twitch.tv/example",
             chat_spike_multiplier=1,
@@ -740,7 +763,14 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
             cooldown_seconds=0,
         )
         task = asyncio.create_task(
-            monitor_chat(reader, pipeline, capture, settings, stop_event)
+            monitor_chat(
+                reader,
+                pipeline,
+                capture,
+                settings,
+                stop_event,
+                progress_messages.append,
+            )
         )
 
         try:
@@ -753,6 +783,11 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
 
         self.assertTrue(pipeline.cancelled)
+        self.assertIn("Watching chat for a fast-activity spike…", progress_messages)
+        self.assertTrue(any("Chat spike found; capturing" in msg for msg in progress_messages))
+        self.assertTrue(
+            any(message.endswith("Cutting the clip…") for message in progress_messages)
+        )
 
     async def test_stops_after_configured_number_of_clip_triggers(self):
         class FakeReader:
@@ -1089,9 +1124,20 @@ class SilentClipTests(unittest.IsolatedAsyncioTestCase):
                 patch("live_clipper.VOICE_ONLY_AUDIO", False),
                 patch("live_clipper.render_vertical", new_callable=AsyncMock) as render,
             ):
-                await pipeline.create_clip()
+                progress_messages = []
+                await pipeline.create_clip(progress_messages.append)
 
             metadata.generate.assert_not_awaited()
+            self.assertEqual(
+                progress_messages,
+                [
+                    "Cutting a clip from the stream buffer…",
+                    "Transcribing speech…",
+                    "Rendering the vertical clip…",
+                    "Saving the completed clip…",
+                    "Clip is ready for review.",
+                ],
+            )
             self.assertIsNone(render.await_args.args[1])
             self.assertEqual(len(list((root / "output").glob("clip_*.srt"))), 1)
             review_metadata = list((root / "output").glob("clip_*.json"))
