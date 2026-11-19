@@ -4,12 +4,13 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libglib2.0-0 libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --extra music-separation --extra youtube-publishing
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential ffmpeg libglib2.0-0 libgomp1 \
+    && uv sync --frozen --no-dev --extra music-separation --extra youtube-publishing \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
