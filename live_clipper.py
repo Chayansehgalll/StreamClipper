@@ -351,7 +351,20 @@ class ChatReader:
         LOGGER.info("Using pytchat for YouTube live chat.")
         # This reader runs in a worker thread; pytchat's default installs a
         # SIGINT handler, which is only allowed from Python's main thread.
-        chat = pytchat.create(video_id=video_id, interruptable=False)
+        try:
+            chat = pytchat.create(video_id=video_id, interruptable=False)
+        except pytchat.InvalidVideoIdException as exc:
+            if self.stop_event.is_set():
+                return
+            detail = getattr(exc, "doc", str(exc))
+            LOGGER.warning(
+                "Pytchat could not resolve YouTube video %s (%s); trying the "
+                "ChatDownloader fallback.",
+                video_id,
+                detail,
+            )
+            self._read_chat_downloader()
+            return
         with self._chat_lock:
             self._chat = chat
         while chat.is_alive() and not self.stop_event.is_set():

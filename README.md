@@ -16,7 +16,8 @@ republish. It does not bypass DRM or platform access controls.
 - CUDA is optional; Whisper falls back to CPU if CUDA initialization or inference fails
 
 Streamlink and chat-provider support depends on the stream's availability.
-YouTube watch/live-video URLs use `pytchat` for live chat; Twitch and Kick use
+YouTube watch/live-video URLs use `pytchat` first, with ChatDownloader as a
+fallback if Pytchat cannot resolve the video's channel ID; Twitch and Kick use
 ChatDownloader. A URL can be recognized by this application even when the
 provider cannot access its live video or chat; such errors are reported rather
 than silently treated as success.

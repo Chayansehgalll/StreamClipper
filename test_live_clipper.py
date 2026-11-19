@@ -112,6 +112,23 @@ class ClipperControllerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class YouTubeChatReaderTests(unittest.TestCase):
+    def test_falls_back_to_chat_downloader_when_pytchat_cannot_resolve_channel(self):
+        import pytchat
+
+        reader = ChatReader("https://www.youtube.com/watch?v=l-oEKLu4Y3w")
+        with (
+            patch(
+                "pytchat.create",
+                side_effect=pytchat.InvalidVideoIdException(
+                    "Cannot find channel id for video id:l-oEKLu4Y3w."
+                ),
+            ),
+            patch.object(reader, "_read_chat_downloader") as fallback,
+        ):
+            reader._read_youtube_chat("l-oEKLu4Y3w")
+
+        fallback.assert_called_once_with()
+
     def test_uses_pytchat_and_normalizes_messages(self):
         timestamp = 1_794_992_978_642
 
