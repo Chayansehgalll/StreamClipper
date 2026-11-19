@@ -1,0 +1,23 @@
+[project]
+name = "live-stream-clipper"
+version = "0.1.0"
+description = "Create vertical clips from authorized live streams using chat activity."
+requires-python = ">=3.10"
+dependencies = [
+    "av<19",
+    "chat-downloader>=0.2.8",
+    "faster-whisper>=1.0.0",
+    "openai>=1.30.0",
+    "opencv-python-headless>=4.10.0,<5",
+    "pytchat==0.5.5",
+    "streamlink>=7.0.0",
+]
+
+[project.optional-dependencies]
+music-separation = [
+    "audio-separator[cpu]==0.48.0",
+    "audioread>=3.0.0",
+]
+
+[tool.uv]
+package = false
