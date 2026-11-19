@@ -32,7 +32,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, Callable
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
@@ -79,6 +79,7 @@ YOUTUBE_TOKEN_FILE = (
 )
 SEGMENT_DIR = TEMP_DIR / "segments"
 SEGMENT_PATTERN = "segment_*.ts"
+_DEFERRED_CLEANUP_PATHS: set[Path] = set()
 FACE_MODEL_PATH = (
     Path(os.getenv("LOCALAPPDATA", str(ROOT_DIR)))
     / "live-stream-clipper"
@@ -399,6 +400,77 @@ class ChatReader:
         return await asyncio.to_thread(self.events.get)
 
 
+def _cleanup_temporary_files(paths: tuple[Path, ...], *, deferred: bool = False) -> None:
+    for path in paths:
+        if deferred:
+            _DEFERRED_CLEANUP_PATHS.discard(path)
+        elif path in _DEFERRED_CLEANUP_PATHS:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("Could not remove temporary file %s.", path)
+
+
+def _finish_cancelled_worker(
+    task: asyncio.Task[Any],
+    cleanup_paths: tuple[Path, ...],
+) -> None:
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        error = None
+    if error is not None:
+        LOGGER.error("Clip worker failed after stop was requested: %s", error)
+    _cleanup_temporary_files(cleanup_paths, deferred=True)
+
+
+async def _run_in_thread_cancellable(
+    function: Callable[..., Any],
+    *args: Any,
+    cleanup_after_cancel: tuple[Path, ...],
+) -> Any:
+    worker = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        _DEFERRED_CLEANUP_PATHS.update(cleanup_after_cancel)
+        worker.add_done_callback(
+            lambda completed: _finish_cancelled_worker(completed, cleanup_after_cancel)
+        )
+        raise
+
+
+async def _terminate_process(
+    process: asyncio.subprocess.Process,
+    timeout: float = 1.0,
+) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+
+async def _communicate_process(
+    process: asyncio.subprocess.Process,
+) -> tuple[bytes, bytes]:
+    try:
+        return await process.communicate()
+    except asyncio.CancelledError:
+        await _terminate_process(process)
+        raise
+
+
 class RollingStreamCapture:
     """Capture Streamlink output into a bounded rolling set of MPEG-TS segments."""
 
@@ -460,13 +532,8 @@ class RollingStreamCapture:
                 pass
 
     async def _terminate(self, process: asyncio.subprocess.Process | None) -> None:
-        if process is not None and process.returncode is None:
-            process.terminate()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
+        if process is not None:
+            await _terminate_process(process)
 
     async def run(self) -> None:
         SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
@@ -669,7 +736,7 @@ async def run_command(command: list[str]) -> None:
         )
     except FileNotFoundError as exc:
         raise ConfigurationError(f"Required executable not found: {command[0]}") from exc
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await _communicate_process(process)
     if process.returncode != 0:
         details = stderr.decode(errors="replace").strip()
         if stdout:
@@ -803,7 +870,11 @@ class Transcriber:
             return self._transcribe_with_model(self._model, audio_path)
 
     async def transcribe(self, audio_path: Path) -> tuple[list[CaptionWord], str]:
-        return await asyncio.to_thread(self._transcribe_sync, audio_path)
+        return await _run_in_thread_cancellable(
+            self._transcribe_sync,
+            audio_path,
+            cleanup_after_cancel=(audio_path,),
+        )
 
 
 def _subtitle_filter_path(path: Path) -> str:
@@ -992,7 +1063,11 @@ async def render_vertical(
 
     facecam_crop = None
     if FACECAM_AUTO_DETECT:
-        facecam_crop = await asyncio.to_thread(detect_facecam_crop, raw_clip)
+        facecam_crop = await _run_in_thread_cancellable(
+            detect_facecam_crop,
+            raw_clip,
+            cleanup_after_cancel=(raw_clip,),
+        )
     if facecam_crop is None:
         facecam_crop = (
             FACECAM_CROP_X,
@@ -1098,7 +1173,7 @@ async def has_audio_stream(path: Path) -> bool:
     except FileNotFoundError as exc:
         raise ConfigurationError("ffprobe is required for voice-only audio processing.") from exc
 
-    stdout, stderr = await process.communicate()
+    stdout, stderr = await _communicate_process(process)
     if process.returncode != 0:
         details = stderr.decode(errors="replace").strip()
         raise RuntimeError(f"ffprobe failed for {path}:\n{details}")
@@ -1120,31 +1195,36 @@ class VoiceStemSeparator:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         input_audio = self.output_dir / f"{stem}_input.wav"
-        await run_command(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(raw_clip),
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-ac",
-                "2",
-                "-ar",
-                "44100",
-                "-c:a",
-                "pcm_s16le",
-                str(input_audio),
-            ]
-        )
         try:
-            return await asyncio.to_thread(self._separate_sync, input_audio)
+            await run_command(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(raw_clip),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(input_audio),
+                ]
+            )
+            voice_audio = self.output_dir / f"{input_audio.stem}_voice.wav"
+            return await _run_in_thread_cancellable(
+                self._separate_sync,
+                input_audio,
+                cleanup_after_cancel=(input_audio, voice_audio),
+            )
         finally:
-            input_audio.unlink(missing_ok=True)
+            _cleanup_temporary_files((input_audio,))
 
     def _separate_sync(self, input_audio: Path) -> Path:
         with self._lock:
@@ -1307,6 +1387,7 @@ class ClipPipeline:
             final_file = OUTPUT_DIR / f"{stem}.mp4"
             metadata_file = OUTPUT_DIR / f"{stem}.json"
             voice_audio: Path | None = None
+            clip_completed = False
 
             try:
                 await self.capture.create_raw_clip(raw_clip)
@@ -1354,20 +1435,24 @@ class ClipPipeline:
                 )
                 temporary_metadata.replace(metadata_file)
                 LOGGER.info("Created clip: %s", final_file)
+                clip_completed = True
             except Exception:
                 LOGGER.exception("Clip processing failed for %s.", stem)
                 raise
             finally:
-                for temporary_file in (raw_clip, voice_audio):
-                    if temporary_file is None:
-                        continue
-                    try:
-                        temporary_file.unlink(missing_ok=True)
-                    except OSError:
-                        LOGGER.exception(
-                            "Could not remove temporary clip %s.",
-                            temporary_file,
+                if not clip_completed:
+                    _cleanup_temporary_files(
+                        (
+                            subtitle_file,
+                            final_file,
+                            metadata_file,
+                            metadata_file.with_suffix(".json.tmp"),
                         )
+                    )
+                temporary_files = [raw_clip]
+                if voice_audio is not None:
+                    temporary_files.append(voice_audio)
+                _cleanup_temporary_files(tuple(temporary_files))
 
 
 async def monitor_chat(
@@ -1542,8 +1627,31 @@ async def monitor_chat(
     finally:
         reader.stop()
         capture.stop()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        pending_tasks = tuple(tasks)
+        if pending_tasks:
+            gather_task = asyncio.gather(*pending_tasks, return_exceptions=True)
+            if stop_event is None:
+                await gather_task
+            else:
+                stop_task = asyncio.create_task(stop_event.wait())
+                done, _ = await asyncio.wait(
+                    (gather_task, stop_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done and stop_event.is_set() and not gather_task.done():
+                    active_tasks = tuple(task for task in pending_tasks if not task.done())
+                    if active_tasks:
+                        LOGGER.info(
+                            "Stop requested; canceling %d in-progress clip task(s).",
+                            len(active_tasks),
+                        )
+                        for task in active_tasks:
+                            task.cancel()
+                    await gather_task
+                else:
+                    stop_task.cancel()
+                    await asyncio.gather(stop_task, return_exceptions=True)
+                    await gather_task
 
 
 def validate_runtime_dependencies() -> None:

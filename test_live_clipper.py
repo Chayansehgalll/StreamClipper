@@ -28,8 +28,11 @@ from live_clipper import (
     MetadataGenerator,
     monitor_chat,
     render_vertical,
+    run_command,
     streamer_name,
     Transcriber,
+    VoiceStemSeparator,
+    _run_in_thread_cancellable,
     youtube_video_id,
 )
 from review_server import ClipReviewServer
@@ -687,6 +690,70 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reader.stopped)
         self.assertTrue(capture.stopped)
 
+    async def test_stop_cancels_an_in_progress_clip_task(self):
+        class FakeReader:
+            calls = 0
+
+            def start(self):
+                pass
+
+            async def next_event(self):
+                self.calls += 1
+                if self.calls == 1:
+                    return "message", {"timestamp": time.time()}
+                await asyncio.Future()
+
+            def stop(self):
+                pass
+
+        class FakeCapture:
+            async def has_full_buffer(self):
+                return True
+
+            def stop(self):
+                pass
+
+        class FakePipeline:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = False
+
+            async def create_clip(self):
+                self.started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+
+        reader = FakeReader()
+        capture = FakeCapture()
+        pipeline = FakePipeline()
+        stop_event = asyncio.Event()
+        settings = ClipSettings(
+            stream_url="https://twitch.tv/example",
+            chat_spike_multiplier=1,
+            clip_duration=1,
+            clip_pre_roll_seconds=0,
+            max_clips=1,
+            min_chat_messages=1,
+            cooldown_seconds=0,
+        )
+        task = asyncio.create_task(
+            monitor_chat(reader, pipeline, capture, settings, stop_event)
+        )
+
+        try:
+            await asyncio.wait_for(pipeline.started.wait(), timeout=2)
+            stop_event.set()
+            await asyncio.wait_for(task, timeout=1)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(pipeline.cancelled)
+
     async def test_stops_after_configured_number_of_clip_triggers(self):
         class FakeReader:
             stopped = False
@@ -890,6 +957,113 @@ class ChatSpikeTests(unittest.TestCase):
 
 
 class SilentClipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_thread_work_defers_input_cleanup_until_worker_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "raw.mp4"
+            input_path.write_bytes(b"raw")
+            worker_started = threading.Event()
+            release_worker = threading.Event()
+
+            def blocking_worker():
+                worker_started.set()
+                release_worker.wait()
+
+            task = asyncio.create_task(
+                _run_in_thread_cancellable(
+                    blocking_worker,
+                    cleanup_after_cancel=(input_path,),
+                )
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(worker_started.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(input_path.exists())
+            finally:
+                release_worker.set()
+
+            for _ in range(100):
+                if not input_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(input_path.exists())
+
+    async def test_cancelling_clip_removes_partial_output_files(self):
+        class FakeCapture:
+            async def create_raw_clip(self, destination):
+                destination.write_bytes(b"raw")
+
+        class FakeTranscriber:
+            async def transcribe(self, _audio_path):
+                return [], ""
+
+        render_started = asyncio.Event()
+
+        async def blocking_render(_raw, _subtitle, output, _voice_audio):
+            output.write_bytes(b"partial")
+            render_started.set()
+            await asyncio.Future()
+
+        pipeline = ClipPipeline(
+            FakeCapture(),
+            FakeTranscriber(),
+            SimpleNamespace(generate=AsyncMock()),
+            "creator",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("live_clipper.TEMP_DIR", root / "temp"),
+                patch("live_clipper.OUTPUT_DIR", root / "output"),
+                patch("live_clipper.VOICE_ONLY_AUDIO", False),
+                patch("live_clipper.render_vertical", side_effect=blocking_render),
+            ):
+                task = asyncio.create_task(pipeline.create_clip())
+                await asyncio.wait_for(render_started.wait(), timeout=1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            self.assertEqual(list((root / "output").glob("clip_*.mp4")), [])
+            self.assertEqual(list((root / "output").glob("clip_*.srt")), [])
+            self.assertEqual(list((root / "output").glob("clip_*.json")), [])
+            self.assertEqual(list((root / "temp").glob("raw_*.mp4")), [])
+
+    async def test_cancelling_run_command_terminates_its_subprocess(self):
+        class FakeProcess:
+            returncode = None
+
+            def __init__(self):
+                self.terminated = False
+
+            async def communicate(self):
+                await asyncio.Future()
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -1
+
+            async def wait(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        process = FakeProcess()
+        with patch(
+            "live_clipper.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ):
+            task = asyncio.create_task(run_command(["ffmpeg"]))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(process.terminated)
+
     async def test_silent_clip_skips_metadata_generation(self):
         class FakeCapture:
             async def create_raw_clip(self, destination):
@@ -929,6 +1103,32 @@ class SilentClipTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VoiceOnlyClipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelling_voice_extraction_removes_partial_audio(self):
+        extraction_started = asyncio.Event()
+
+        async def blocking_extract(command):
+            input_audio = Path(command[-1])
+            input_audio.parent.mkdir(parents=True, exist_ok=True)
+            input_audio.write_bytes(b"partial")
+            extraction_started.set()
+            await asyncio.Future()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("live_clipper.TEMP_DIR", root / "temp"),
+                patch("live_clipper.has_audio_stream", new=AsyncMock(return_value=True)),
+                patch("live_clipper.run_command", side_effect=blocking_extract),
+            ):
+                separator = VoiceStemSeparator()
+                task = asyncio.create_task(separator.isolate(root / "raw.mp4", "clip"))
+                await asyncio.wait_for(extraction_started.wait(), timeout=1)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            self.assertFalse((root / "temp" / "voice_stems" / "clip_input.wav").exists())
+
     async def test_voice_stem_is_used_for_transcription_and_output(self):
         class FakeCapture:
             async def create_raw_clip(self, destination):

@@ -132,10 +132,12 @@ dashboard.
 ## Review and publishing
 
 Use **Start observing and clipping** to begin and **Stop clipping** to end
-monitoring. A stop request lets an already-processing clip finish; the dashboard
-then returns to its start form. Monitoring also stops after the configured clip
-limit. Completed clips appear below the controls with editable title,
-description, and hashtags. Nothing is uploaded until you click an upload
+monitoring immediately. Any clip currently being processed is discarded. The
+dashboard then returns to its start form. Monitoring also stops after the
+configured clip limit. Completed clips appear below the controls with editable
+title, description, and hashtags. An already-running model inference may
+continue in the background until its current operation returns; its clip is
+discarded and not added to review. Nothing is uploaded until you click an upload
 action. YouTube uploads default to **private**; choose unlisted or public
 explicitly in the review page if desired.
 

@@ -641,9 +641,9 @@ document.querySelector("#control-form").addEventListener("submit",async event=>{
   catch(error){controlMessage.textContent=error.message;controlMessage.classList.add("error");}
 });
 document.querySelector("#stop").addEventListener("click",async()=>{
-  if(!confirm("Stop observing this stream? Any clip already being processed will finish."))return;
+  if(!confirm("Stop observing now? Any clip currently being processed will be discarded."))return;
   document.querySelector("#stop").disabled=true;
-  document.querySelector("#active-message").textContent="Stopping…";
+  document.querySelector("#active-message").textContent="Stopping and discarding the current clip…";
   try{await post("/api/stop",{});await updateStatus();}
   catch(error){document.querySelector("#active-message").textContent=error.message;document.querySelector("#stop").disabled=false;}
 });
