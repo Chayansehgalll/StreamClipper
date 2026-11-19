@@ -1,4 +1,5 @@
 .env
+youtube_client_secret.json
 __pycache__/
 *.py[cod]
 temp/

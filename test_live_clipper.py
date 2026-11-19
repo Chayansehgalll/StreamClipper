@@ -8,6 +8,7 @@ from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.request import Request, urlopen
 
 from live_clipper import (
     CaptionWord,
@@ -26,6 +27,7 @@ from live_clipper import (
     Transcriber,
     youtube_video_id,
 )
+from review_server import ClipReviewServer
 
 
 class PlatformTests(unittest.TestCase):
@@ -319,6 +321,103 @@ class MetadataResponseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response_format["json_schema"]["strict"])
 
 
+class ClipReviewServerTests(unittest.TestCase):
+    def test_review_lists_clip_saves_edits_and_serves_video_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            clip_id = "clip_creator_20261119_120000"
+            (output_dir / f"{clip_id}.mp4").write_bytes(b"0123456789")
+            metadata_path = output_dir / f"{clip_id}.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "title": "Original title",
+                        "description": "Original description",
+                        "hashtags": ["#Clip"],
+                        "transcript": "A transcript",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = ClipReviewServer(
+                output_dir,
+                output_dir / "client-secret.json",
+                output_dir / "token.json",
+            )
+            server.start()
+            try:
+                with urlopen(f"{server.url}api/clips") as response:
+                    clips = json.loads(response.read())
+                self.assertEqual(clips[0]["id"], clip_id)
+
+                payload = {
+                    "clip_id": clip_id,
+                    "title": "Reviewed title",
+                    "description": "Reviewed description",
+                    "hashtags": ["#Reviewed"],
+                }
+                request = Request(
+                    f"{server.url}api/update",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Review-Token": server._token,
+                    },
+                )
+                with urlopen(request) as response:
+                    self.assertTrue(json.loads(response.read())["ok"])
+                saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved_metadata["title"], "Reviewed title")
+                self.assertEqual(saved_metadata["hashtags"], ["#Reviewed"])
+
+                request = Request(
+                    f"{server.url}media/{clip_id}.mp4",
+                    headers={"Range": "bytes=2-5"},
+                )
+                with urlopen(request) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.read(), b"2345")
+            finally:
+                server.stop()
+
+    def test_explicit_youtube_upload_defaults_to_private_and_records_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            clip_id = "clip_creator_20261119_120000"
+            video_path = output_dir / f"{clip_id}.mp4"
+            metadata_path = output_dir / f"{clip_id}.json"
+            video_path.write_bytes(b"video")
+            metadata_path.write_text(
+                json.dumps({"title": "", "description": "", "hashtags": []}),
+                encoding="utf-8",
+            )
+            server = ClipReviewServer(
+                output_dir,
+                output_dir / "client-secret.json",
+                output_dir / "token.json",
+            )
+            payload = {
+                "clip_id": clip_id,
+                "title": "Approved title",
+                "description": "Approved description",
+                "hashtags": ["#Approved"],
+            }
+            try:
+                with patch.object(server, "_upload_video", return_value="video123") as upload:
+                    result = server._upload_to_youtube(payload)
+
+                self.assertEqual(result["url"], "https://www.youtube.com/watch?v=video123")
+                self.assertEqual(upload.call_args.args[0], video_path)
+                self.assertEqual(upload.call_args.args[2], "private")
+                saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    saved_metadata["youtube_upload"],
+                    {"video_id": "video123", "privacy_status": "private"},
+                )
+            finally:
+                server.stop()
+
+
 class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
     async def test_stops_after_configured_number_of_clip_triggers(self):
         class FakeReader:
@@ -553,7 +652,12 @@ class SilentClipTests(unittest.IsolatedAsyncioTestCase):
             metadata.generate.assert_not_awaited()
             self.assertIsNone(render.await_args.args[1])
             self.assertEqual(len(list((root / "output").glob("clip_*.srt"))), 1)
-            self.assertEqual(list((root / "output").glob("*.json")), [])
+            review_metadata = list((root / "output").glob("clip_*.json"))
+            self.assertEqual(len(review_metadata), 1)
+            review_data = json.loads(review_metadata[0].read_text(encoding="utf-8"))
+            self.assertEqual(review_data["title"], "")
+            self.assertEqual(review_data["hashtags"], [])
+            self.assertEqual(review_data["streamer"], "creator")
 
 
 class VoiceOnlyClipTests(unittest.IsolatedAsyncioTestCase):

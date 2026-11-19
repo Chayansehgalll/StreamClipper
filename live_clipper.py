@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import webbrowser
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,6 +35,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
+
+from review_server import ClipReviewServer
 
 
 # Configuration
@@ -66,6 +69,12 @@ FACECAM_MARGIN = 40
 ROOT_DIR = Path(__file__).resolve().parent
 TEMP_DIR = ROOT_DIR / "temp"
 OUTPUT_DIR = ROOT_DIR / "output"
+YOUTUBE_CLIENT_SECRETS_FILE = ROOT_DIR / "youtube_client_secret.json"
+YOUTUBE_TOKEN_FILE = (
+    Path(os.getenv("LOCALAPPDATA", str(Path.home())))
+    / "live-stream-clipper"
+    / "youtube_token.json"
+)
 SEGMENT_DIR = TEMP_DIR / "segments"
 SEGMENT_PATTERN = "segment_*.ts"
 FACE_MODEL_PATH = (
@@ -1243,16 +1252,24 @@ class ClipPipeline:
                     voice_audio,
                 )
                 LOGGER.info("Rendered clip video: %s", final_file)
+                metadata = {
+                    "title": "",
+                    "description": "",
+                    "hashtags": [],
+                    "streamer": self.channel,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "transcript": transcript,
+                }
                 if transcript.strip():
-                    metadata = await self.metadata.generate(transcript, self.channel)
-                    temporary_metadata = metadata_file.with_suffix(".json.tmp")
-                    temporary_metadata.write_text(
-                        json.dumps(metadata, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    temporary_metadata.replace(metadata_file)
+                    metadata.update(await self.metadata.generate(transcript, self.channel))
                 else:
                     LOGGER.warning("Skipping Groq metadata because no speech transcript was detected.")
+                temporary_metadata = metadata_file.with_suffix(".json.tmp")
+                temporary_metadata.write_text(
+                    json.dumps(metadata, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary_metadata.replace(metadata_file)
                 LOGGER.info("Created clip: %s", final_file)
             except Exception:
                 LOGGER.exception("Clip processing failed for %s.", stem)
@@ -1421,14 +1438,35 @@ async def run_application(url: str) -> None:
         metadata=MetadataGenerator(GROQ_API_KEY, GROQ_MODEL),
         channel=streamer_name(url),
     )
+    review_server = ClipReviewServer(
+        OUTPUT_DIR,
+        YOUTUBE_CLIENT_SECRETS_FILE,
+        YOUTUBE_TOKEN_FILE,
+    )
+    review_server.start()
+    LOGGER.info("Clip review page: %s", review_server.url)
+    try:
+        review_page_opened = webbrowser.open(review_server.url, new=2)
+    except (webbrowser.Error, OSError):
+        LOGGER.exception("Could not open the review page automatically.")
+        review_page_opened = False
+    if not review_page_opened:
+        LOGGER.warning("Could not open the review page automatically: %s", review_server.url)
     capture_task = asyncio.create_task(capture.run(), name="stream-capture")
     try:
         await monitor_chat(reader, pipeline, capture)
+        capture.stop()
+        if not capture_task.done():
+            capture_task.cancel()
+        await asyncio.gather(capture_task, return_exceptions=True)
+        LOGGER.info("Review completed clips at %s; close the page to exit.", review_server.url)
+        await asyncio.to_thread(review_server.wait_until_closed)
     finally:
         capture.stop()
         if not capture_task.done():
             capture_task.cancel()
         await asyncio.gather(capture_task, return_exceptions=True)
+        review_server.stop()
 
 
 def main() -> None:

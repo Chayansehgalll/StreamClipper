@@ -51,7 +51,7 @@ dependencies, including the optional CPU audio-separation package used by the
 default voice-only mode:
 
 ```powershell
-uv sync --extra music-separation
+uv sync --extra music-separation --extra youtube-publishing
 ```
 
 The audio-separation extra includes PyTorch and ONNX Runtime. The selected
@@ -68,7 +68,7 @@ GROQ_API_KEY=your-groq-key-goes-here
 Load `.env` when launching with `uv`:
 
 ```powershell
-uv run --extra music-separation --env-file .env python .\live_clipper.py
+uv run --extra music-separation --extra youtube-publishing --env-file .env python .\live_clipper.py
 ```
 
 The variable name must be exactly `GROQ_API_KEY`. Do not share or commit your
@@ -79,17 +79,37 @@ by default. Set `GROQ_MODEL` in `.env` to select another Groq-supported model.
 At the prompt, enter only the stream URL, for example
 `https://www.twitch.tv/Lysium` or `twitch.tv/Lysium` (the scheme is optional).
 Run shell commands such as
-`uv run --extra music-separation --env-file .env python .\live_clipper.py`
+`uv run --extra music-separation --extra youtube-publishing --env-file .env python .\live_clipper.py`
 at the PowerShell prompt, not inside the app's URL prompt. You can instead set
 `STREAM_URL` near the top of `live_clipper.py`.
 
-The app writes final MP4s and SRT files to `output\`, and writes metadata JSON
-when speech is transcribed and Groq returns valid metadata. Silent clips are
-rendered without subtitles and skip metadata generation.
+The app writes final MP4s, SRT files, and editable review metadata JSON files to
+`output\`. Generated title, description, and hashtags are added when speech is
+transcribed. Silent clips have blank metadata fields for you to fill in during
+review and are rendered without subtitles.
 Temporary clips and the rolling stream-segment buffer are written under `temp\`.
 The segment buffer is pruned as it ages. Initial buffering takes approximately
 the configured clip duration, and clips can only be generated after enough live
 segments have arrived.
+
+## Review and publishing
+
+The app opens a local review page while it monitors chat. Completed clips appear
+there with editable title, description, and hashtags. Nothing is uploaded until
+you click an upload action. YouTube uploads default to **private**; choose
+unlisted or public explicitly in the review page if desired. After monitoring
+ends, the review page stays open until you close it.
+
+To enable YouTube uploads, create a Google Cloud project, enable the YouTube
+Data API v3, and create an OAuth client ID for a Desktop app. Download its JSON
+file as `youtube_client_secret.json` in the project root. That file is ignored
+by Git. The first YouTube upload opens Google's consent flow; the resulting
+token is stored under `%LOCALAPPDATA%\live-stream-clipper\`.
+
+Instagram direct publishing is not enabled. The review page's Instagram action
+saves the details, copies the caption, and opens Instagram for manual upload.
+Direct Instagram publishing requires a Professional account linked to a
+Facebook Page and publicly reachable video hosting.
 
 Voice-only processing is best-effort music-vocal separation, not a reliable
 music detector or speech-versus-game-audio separator. It is applied to every
