@@ -292,9 +292,15 @@ class MetadataTests(unittest.TestCase):
 class MetadataResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_requests_strict_json_and_validates_the_result(self):
         response_data = {
-            "title": "Wild stream moment!",
-            "description": "A surprising moment from the live stream.",
-            "hashtags": ["#Shorts", "#Live", "#Gaming", "#Streamer", "#Clip"],
+            "title": "GTA 6: Wild Stream Moment!",
+            "description": "A surprising moment in GTA 6 gameplay.",
+            "hashtags": [
+                "#GTA6",
+                "#GTAVI",
+                "#GTA6Gameplay",
+                "#GrandTheftAutoVI",
+                "#GTA6Shorts",
+            ],
         }
         create = AsyncMock(
             return_value=SimpleNamespace(
@@ -312,16 +318,70 @@ class MetadataResponseTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        result = await generator.generate("A transcript.", "creator")
+        result = await generator.generate("Bhai, GTA 6 mein kya scene hai?", "creator")
 
         self.assertEqual(result["title"], response_data["title"])
         self.assertEqual(result["hashtags"], response_data["hashtags"])
+        system_prompt = create.await_args.kwargs["messages"][0]["content"]
+        user_prompt = create.await_args.kwargs["messages"][1]["content"]
+        self.assertIn("Hindi, Hinglish, or English", system_prompt)
+        self.assertIn("natural English", system_prompt)
+        self.assertIn("relevant to GTA 6 gaming", system_prompt)
+        self.assertIn("Game: Grand Theft Auto VI (GTA 6)", user_prompt)
         response_format = create.await_args.kwargs["response_format"]
         self.assertEqual(response_format["type"], "json_schema")
         self.assertTrue(response_format["json_schema"]["strict"])
 
 
 class ClipReviewServerTests(unittest.TestCase):
+    def test_delete_removes_local_files_but_retains_youtube_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            clip_id = "clip_creator_20261119_120000"
+            video_path = output_dir / f"{clip_id}.mp4"
+            subtitle_path = output_dir / f"{clip_id}.srt"
+            metadata_path = output_dir / f"{clip_id}.json"
+            video_path.write_bytes(b"video")
+            subtitle_path.write_text("subtitle", encoding="utf-8")
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "youtube_upload": {
+                            "video_id": "uploaded123",
+                            "privacy_status": "private",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            server = ClipReviewServer(
+                output_dir,
+                output_dir / "client-secret.json",
+                output_dir / "token.json",
+            )
+            server.start()
+            try:
+                request = Request(
+                    f"{server.url}api/delete",
+                    data=json.dumps({"clip_id": clip_id}).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Review-Token": server._token,
+                    },
+                )
+                with urlopen(request) as response:
+                    result = json.loads(response.read())
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["youtube_upload_retained"])
+                self.assertFalse(video_path.exists())
+                self.assertFalse(subtitle_path.exists())
+                self.assertFalse(metadata_path.exists())
+                self.assertIn("uploaded-badge", server._review_page())
+                self.assertIn("Delete clip", server._review_page())
+            finally:
+                server.stop()
+
     def test_review_lists_clip_saves_edits_and_serves_video_ranges(self):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)

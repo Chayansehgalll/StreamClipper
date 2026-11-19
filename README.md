@@ -85,8 +85,9 @@ at the PowerShell prompt, not inside the app's URL prompt. You can instead set
 
 The app writes final MP4s, SRT files, and editable review metadata JSON files to
 `output\`. Generated title, description, and hashtags are added when speech is
-transcribed. Silent clips have blank metadata fields for you to fill in during
-review and are rendered without subtitles.
+transcribed. Metadata is written in English and focused on GTA 6 gameplay, even
+when the transcript is Hindi or Hinglish. Silent clips have blank metadata
+fields for you to fill in during review and are rendered without subtitles.
 Temporary clips and the rolling stream-segment buffer are written under `temp\`.
 The segment buffer is pruned as it ages. Initial buffering takes approximately
 the configured clip duration, and clips can only be generated after enough live

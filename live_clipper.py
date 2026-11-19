@@ -43,10 +43,10 @@ from review_server import ClipReviewServer
 STREAM_URL = ""  # Leave empty to enter a URL when the program starts.
 CHAT_WINDOW_SECONDS = 5
 CHAT_BASELINE_SECONDS = 300
-CHAT_SPIKE_MULTIPLIER = 1.3
+CHAT_SPIKE_MULTIPLIER = 2.5
 CHAT_SPIKE_MIN_MESSAGES = 2
-CLIP_DURATION = 45
-CLIP_PRE_ROLL_SECONDS = 12
+CLIP_DURATION = 46
+CLIP_PRE_ROLL_SECONDS = 10
 COOLDOWN_PERIOD = 10
 WHISPER_MODEL_SIZE = "small"  # "small" or "base"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -100,6 +100,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 LOGGER = logging.getLogger("live-clipper")
 
 
@@ -704,8 +706,7 @@ class Transcriber:
         contains_devanagari = any("\u0900" <= character <= "\u097f" for character in transcript)
         if detected_language != "en" or contains_devanagari:
             LOGGER.info(
-                "Skipping burned captions; only English captions are enabled (detected language: %s).",
-                detected_language or "unknown",
+                "Captions skipped: speech is not English; only English captions are enabled."
             )
             words = []
         return words, transcript
@@ -1156,15 +1157,22 @@ class MetadataGenerator:
                 {
                     "role": "system",
                     "content": (
-                        "Create accurate short-form video metadata from the supplied transcript. "
-                        "Return JSON with title, description, and hashtags (an array of exactly "
-                        "five strings, each beginning with #). Do not invent events or claims. "
-                        "The title must be under 50 characters and may use emojis."
+                        "Create accurate short-form metadata for GTA 6 gameplay from the supplied "
+                        "transcript. The transcript may be Hindi, Hinglish, or English: understand "
+                        "its meaning, but write the title, description, and all hashtags in natural "
+                        "English. Make the title and description clearly about GTA 6, and keep all "
+                        "five hashtags relevant to GTA 6 gaming. Do not invent events, missions, "
+                        "characters, or claims not supported by the transcript. Return JSON with "
+                        "title, description, and hashtags (an array of exactly five strings, each "
+                        "beginning with #). The title must be under 50 characters and may use emojis."
                     ),
                 },
                 {
                     "role": "user",
-                    "content": f"Streamer: {channel}\nTranscript:\n{transcript[:12000]}",
+                    "content": (
+                        f"Game: Grand Theft Auto VI (GTA 6)\n"
+                        f"Streamer: {channel}\nTranscript:\n{transcript[:12000]}"
+                    ),
                 },
             ],
         )
@@ -1235,9 +1243,7 @@ class ClipPipeline:
                     words, transcript = await self.transcriber.transcribe(transcription_audio)
                 subtitle_text = format_subtitles(words)
                 if not subtitle_text:
-                    if transcript.strip():
-                        LOGGER.info("No English captions were generated; exporting without burned subtitles.")
-                    else:
+                    if not transcript.strip():
                         LOGGER.warning("No speech was detected; exporting the clip without burned subtitles.")
                     subtitle_file.write_text("", encoding="utf-8")
                     subtitle_argument = None
@@ -1315,14 +1321,14 @@ async def monitor_chat(
 
     reader.start()
     LOGGER.info(
-        "Monitoring chat: spike=%.1fx baseline (minimum %d messages/%ds); "
-        "clip=%ds with %ds pre-roll; cooldown=%ds; clip limit=%d.",
+        "Watching chat for fast activity: trigger at %.1fx usual rate or at least "
+        "%d messages in %ds; clips are %ds total with %ds before the spike; "
+        "maximum %d clips.",
         CHAT_SPIKE_MULTIPLIER,
         CHAT_SPIKE_MIN_MESSAGES,
         CHAT_WINDOW_SECONDS,
         CLIP_DURATION,
         CLIP_PRE_ROLL_SECONDS,
-        COOLDOWN_PERIOD,
         MAX_CLIPS_PER_RUN,
     )
     try:
@@ -1345,17 +1351,28 @@ async def monitor_chat(
             if not spike:
                 spike_active = False
             if now - last_activity_log >= 10:
-                usual_rate = (
-                    f"{recent_count / baseline_expected:.1f}x usual "
-                    f"(baseline {baseline_expected:.1f}/{CHAT_WINDOW_SECONDS}s)"
-                    if baseline_expected > 0
-                    else "usual rate unavailable (no prior chat messages)"
-                )
+                if baseline_expected > 0:
+                    pace_ratio = recent_count / baseline_expected
+                    if pace_ratio < 1:
+                        comparison = (
+                            f"{pace_ratio:.0%} of usual "
+                            f"(about {baseline_expected:.1f} messages per "
+                            f"{CHAT_WINDOW_SECONDS}s)"
+                        )
+                    else:
+                        comparison = (
+                            f"{pace_ratio:.1f}x usual "
+                            f"(about {baseline_expected:.1f} messages per "
+                            f"{CHAT_WINDOW_SECONDS}s)"
+                        )
+                else:
+                    comparison = "usual rate not established yet"
                 LOGGER.info(
-                    "Chat activity: %d messages/%ds; %s; spike threshold=%d.",
+                    "Chat pace: %d messages in the last %ds; %s; "
+                    "%d needed to trigger a clip.",
                     recent_count,
                     CHAT_WINDOW_SECONDS,
-                    usual_rate,
+                    comparison,
                     threshold,
                 )
                 last_activity_log = now
@@ -1367,13 +1384,13 @@ async def monitor_chat(
                 if not await capture.has_full_buffer():
                     if not buffer_wait_logged:
                         LOGGER.info(
-                            "Waiting for %d seconds of stream buffer before triggering clips.",
+                            "Building the %d-second stream buffer; clips can start once it is ready.",
                             CLIP_DURATION,
                         )
                         buffer_wait_logged = True
                     continue
                 if buffer_wait_logged:
-                    LOGGER.info("Stream buffer is ready; chat triggers are enabled.")
+                    LOGGER.info("Stream buffer is ready; automatic clipping is active.")
                     buffer_wait_logged = False
 
                 async def create_spike_clip() -> None:
@@ -1383,7 +1400,7 @@ async def monitor_chat(
                 last_trigger = now
                 spike_active = True
                 LOGGER.info(
-                    "Chat spike: %d messages in %ds (threshold %d).",
+                    "Fast chat detected: %d messages in %ds (trigger threshold: %d).",
                     recent_count,
                     CHAT_WINDOW_SECONDS,
                     threshold,

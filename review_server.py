@@ -76,6 +76,9 @@ class ClipReviewServer:
                     elif route == "/api/youtube-upload":
                         result = owner._upload_to_youtube(payload)
                         self._send_json(200, result)
+                    elif route == "/api/delete":
+                        result = owner._delete_clip(payload)
+                        self._send_json(200, result)
                     elif route == "/api/instagram-prep":
                         result = owner._update_metadata(payload)
                         self._send_json(
@@ -316,6 +319,33 @@ class ClipReviewServer:
         self._write_metadata(metadata_path, metadata)
         return {"ok": True, "clip_id": payload["clip_id"]}
 
+    def _delete_clip(self, payload: dict[str, Any]) -> dict[str, Any]:
+        clip_id = payload.get("clip_id")
+        with self._upload_lock:
+            video_path, metadata_path = self._clip_paths(clip_id)
+            metadata = self._read_metadata(metadata_path)
+            upload_info = metadata.get("youtube_upload")
+            youtube_upload_retained = (
+                isinstance(upload_info, dict) and bool(upload_info.get("video_id"))
+            )
+            for path in (
+                video_path,
+                video_path.with_suffix(".srt"),
+                metadata_path,
+            ):
+                if path.is_file():
+                    path.unlink()
+        LOGGER.info(
+            "Deleted local clip %s; YouTube upload retained=%s.",
+            clip_id,
+            youtube_upload_retained,
+        )
+        return {
+            "ok": True,
+            "clip_id": clip_id,
+            "youtube_upload_retained": youtube_upload_retained,
+        }
+
     def _upload_to_youtube(self, payload: dict[str, Any]) -> dict[str, Any]:
         clip_id = payload.get("clip_id")
         video_path, metadata_path = self._clip_paths(clip_id)
@@ -428,13 +458,16 @@ header{padding:20px 5%;background:#1f2937;position:sticky;top:0;z-index:1}
 h1{font-size:1.35rem;margin:0 0 6px}p{color:#cbd5e1}.toolbar{display:flex;gap:10px}
 main{max-width:1100px;margin:24px auto;padding:0 16px}
 .card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:18px;margin:18px 0}
+h2{display:flex;align-items:center;gap:10px}
+.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:.72rem;font-weight:700}
+.uploaded-badge{background:#166534;color:#dcfce7}
 .layout{display:grid;grid-template-columns:minmax(260px,1fr) minmax(280px,1.3fr);gap:20px}
 video{width:100%;max-height:70vh;background:#000;border-radius:8px}
 label{display:block;font-weight:600;margin:10px 0 4px}
 input,textarea,select{box-sizing:border-box;width:100%;padding:10px;border-radius:6px;border:1px solid #4b5563;background:#111827;color:#f9fafb}
 textarea{min-height:90px;resize:vertical}.buttons{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
 button{border:0;border-radius:6px;padding:10px 14px;cursor:pointer;background:#374151;color:white;font-weight:600}
-button.primary{background:#2563eb}button.instagram{background:#be185d}button:disabled{opacity:.55;cursor:wait}
+button.primary{background:#2563eb}button.instagram{background:#be185d}button.danger{background:#b91c1c}button:disabled{opacity:.55;cursor:wait}
 .status{min-height:24px;color:#93c5fd}.uploaded{color:#86efac}.muted{color:#9ca3af}
 @media(max-width:720px){.layout{grid-template-columns:1fr}}
 </style>
@@ -476,7 +509,11 @@ async function loadClips(){
     if(!clips.length){const empty=document.createElement("p");empty.textContent="No completed clips yet. New clips will appear here.";clipsRoot.append(empty);return;}
     for(const clip of clips){
       const card=document.createElement("section");card.className="card";
-      const heading=document.createElement("h2");heading.textContent=clip.id;card.append(heading);
+      const heading=document.createElement("h2");heading.textContent=clip.id;
+      if(clip.youtube_upload?.video_id){
+        const badge=document.createElement("span");badge.className="badge uploaded-badge";badge.textContent="Uploaded";heading.append(badge);
+      }
+      card.append(heading);
       const layout=document.createElement("div");layout.className="layout";
       const video=document.createElement("video");video.controls=true;video.preload="metadata";video.src=clip.video_url;layout.append(video);
       const form=document.createElement("div");
@@ -497,10 +534,28 @@ async function loadClips(){
         if(clip.youtube_upload?.video_id)return;
         if(!confirm("Upload this clip to YouTube as "+visibility.value+"?"))return;
         uploadButton.disabled=true;status.textContent="Uploading…";
-        try{const result=await post("/api/youtube-upload",{...payload(),visibility:visibility.value});status.classList.add("uploaded");status.textContent="Uploaded: "+result.url;uploadButton.textContent="Already uploaded";}
+        try{
+          const result=await post("/api/youtube-upload",{...payload(),visibility:visibility.value});
+          status.classList.add("uploaded");status.textContent="Uploaded: "+result.url;uploadButton.textContent="Already uploaded";
+          if(!heading.querySelector(".uploaded-badge")){
+            const badge=document.createElement("span");badge.className="badge uploaded-badge";badge.textContent="Uploaded";heading.append(badge);
+          }
+        }
         catch(error){status.textContent=error.message;uploadButton.disabled=false;}
       });
       uploadButton.disabled=Boolean(clip.youtube_upload?.video_id);
+      const deleteButton=button("Delete clip","danger",async()=>{
+        if(!confirm("Delete this clip's local video, subtitle, and metadata files? Any YouTube upload will remain online."))return;
+        deleteButton.disabled=true;status.textContent="Deleting local files…";
+        try{
+          const result=await post("/api/delete",{clip_id:clip.id});
+          const notice=document.createElement("p");notice.className="status";
+          notice.textContent=result.youtube_upload_retained
+            ?"Local clip deleted. Its YouTube upload remains online."
+            :"Local clip deleted.";
+          card.replaceWith(notice);
+        }catch(error){status.textContent=error.message;deleteButton.disabled=false;}
+      });
       actions.append(uploadButton,button("Prepare Instagram manual upload","instagram",async()=>{
         const caption=[description.value,hashtags.value].filter(Boolean).join("\n\n");
         window.open("https://www.instagram.com/","_blank","noopener");
@@ -508,7 +563,7 @@ async function loadClips(){
         catch(error){status.textContent="Copy the caption above, then upload the video manually on Instagram.";}
         try{await post("/api/instagram-prep",payload());}
         catch(error){status.textContent=error.message;}
-      }));
+      }),deleteButton);
       form.append(actions,status);layout.append(form);card.append(layout);clipsRoot.append(card);
     }
   }catch(error){clipsRoot.textContent=error.message;}
