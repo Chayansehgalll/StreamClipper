@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -22,17 +24,34 @@ _YOUTUBE_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
 class ClipReviewServer:
-    """Serve a loopback-only clip review page and explicit upload actions."""
+    """Serve the clipper dashboard and review actions."""
 
     def __init__(
         self,
         output_dir: Path,
         client_secrets_file: Path,
         token_file: Path,
+        controller: Any | None = None,
+        default_settings: dict[str, Any] | None = None,
+        username: str = "",
+        password: str = "",
+        host: str = "127.0.0.1",
+        port: int = 0,
     ) -> None:
         self.output_dir = output_dir.resolve()
         self.client_secrets_file = client_secrets_file.resolve()
         self.token_file = token_file.resolve()
+        self.controller = controller
+        self.default_settings = default_settings or {}
+        self.username = username
+        self.password = password
+        self.host = host
+        if bool(username) != bool(password):
+            raise ValueError("Both dashboard username and password must be configured.")
+        if password and len(password) < 16:
+            raise ValueError("Dashboard password must be at least 16 characters.")
+        if not self._is_loopback_host(host) and not (username and password):
+            raise ValueError("Dashboard authentication is required on a public interface.")
         self._token = secrets.token_urlsafe(32)
         self._closed = threading.Event()
         self._upload_lock = threading.Lock()
@@ -44,7 +63,26 @@ class ClipReviewServer:
             def log_message(self, format_string: str, *args: Any) -> None:
                 LOGGER.debug(format_string, *args)
 
+            def _authorize(self) -> bool:
+                if not owner.username:
+                    return True
+                expected = "Basic " + base64.b64encode(
+                    f"{owner.username}:{owner.password}".encode("utf-8")
+                ).decode("ascii")
+                if hmac.compare_digest(self.headers.get("Authorization", ""), expected):
+                    return True
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="StreamClipper"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return False
+
             def do_GET(self) -> None:
+                if urlparse(self.path).path == "/healthz":
+                    self._send_bytes(200, b"ok", "text/plain; charset=utf-8")
+                    return
+                if not self._authorize():
+                    return
                 parsed = urlparse(self.path)
                 if parsed.path == "/":
                     self._send_bytes(
@@ -52,6 +90,8 @@ class ClipReviewServer:
                         owner._review_page().encode("utf-8"),
                         "text/html; charset=utf-8",
                     )
+                elif parsed.path == "/api/status":
+                    self._send_json(200, owner._control_status())
                 elif parsed.path == "/api/clips":
                     self._send_json(200, owner._list_clips())
                 elif parsed.path.startswith("/media/"):
@@ -60,6 +100,8 @@ class ClipReviewServer:
                     self._send_json(404, {"error": "Not found."})
 
             def do_POST(self) -> None:
+                if not self._authorize():
+                    return
                 if not hmac.compare_digest(
                     self.headers.get("X-Review-Token", ""),
                     owner._token,
@@ -72,6 +114,12 @@ class ClipReviewServer:
                     route = urlparse(self.path).path
                     if route == "/api/update":
                         result = owner._update_metadata(payload)
+                        self._send_json(200, result)
+                    elif route == "/api/start":
+                        result = owner._start_monitoring(payload)
+                        self._send_json(200, result)
+                    elif route == "/api/stop":
+                        result = owner._stop_monitoring()
                         self._send_json(200, result)
                     elif route == "/api/youtube-upload":
                         result = owner._upload_to_youtube(payload)
@@ -91,15 +139,6 @@ class ClipReviewServer:
                                 ),
                             },
                         )
-                    elif route == "/api/close":
-                        if owner._upload_lock.locked():
-                            raise RuntimeError("Wait for the current upload to finish before closing.")
-                        self._send_json(200, {"ok": True})
-                        threading.Thread(
-                            target=owner.server.shutdown,
-                            name="review-server-shutdown",
-                            daemon=True,
-                        ).start()
                     else:
                         self._send_json(404, {"error": "Not found."})
                 except (ValueError, RuntimeError) as exc:
@@ -135,6 +174,7 @@ class ClipReviewServer:
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -190,9 +230,18 @@ class ClipReviewServer:
                         self.wfile.write(chunk)
                         remaining -= len(chunk)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
+        self.server = ThreadingHTTPServer((host, port), RequestHandler)
         self.server.daemon_threads = True
         self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        if host.lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
 
     @property
     def url(self) -> str:
@@ -227,7 +276,25 @@ class ClipReviewServer:
             self.server.server_close()
 
     def _review_page(self) -> str:
-        return _REVIEW_PAGE.replace("__REVIEW_TOKEN__", json.dumps(self._token))
+        return (
+            _REVIEW_PAGE.replace("__REVIEW_TOKEN__", json.dumps(self._token))
+            .replace("__DEFAULT_SETTINGS__", json.dumps(self.default_settings))
+        )
+
+    def _control_status(self) -> dict[str, Any]:
+        if self.controller is None:
+            return {"status": "idle", "stream_url": "", "error": ""}
+        return self.controller.status()
+
+    def _start_monitoring(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.controller is None:
+            raise RuntimeError("The clipper controls are not configured.")
+        return self.controller.start(payload)
+
+    def _stop_monitoring(self) -> dict[str, Any]:
+        if self.controller is None:
+            raise RuntimeError("The clipper controls are not configured.")
+        return self.controller.stop()
 
     def _clip_paths(self, clip_id: Any) -> tuple[Path, Path]:
         if not isinstance(clip_id, str) or not _CLIP_ID_PATTERN.fullmatch(clip_id):
@@ -458,6 +525,8 @@ header{padding:20px 5%;background:#1f2937;position:sticky;top:0;z-index:1}
 h1{font-size:1.35rem;margin:0 0 6px}p{color:#cbd5e1}.toolbar{display:flex;gap:10px}
 main{max-width:1100px;margin:24px auto;padding:0 16px}
 .card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:18px;margin:18px 0}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:4px 16px}
+.hidden,[hidden]{display:none!important}.error{color:#fca5a5}.run-status{font-weight:700}
 h2{display:flex;align-items:center;gap:10px}
 .badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:.72rem;font-weight:700}
 .uploaded-badge{background:#166534;color:#dcfce7}
@@ -474,14 +543,47 @@ button.primary{background:#2563eb}button.instagram{background:#be185d}button.dan
 </head>
 <body>
 <header>
-  <h1>Review clips before publishing</h1>
-  <p>No clip is uploaded unless you click its YouTube upload button. YouTube visibility defaults to private.</p>
-  <div class="toolbar"><button id="refresh">Refresh clips</button><button id="close">Close review</button></div>
+  <h1>StreamClipper</h1>
+  <p>Start monitoring a live stream, then review completed clips below. Uploads still require your approval.</p>
+  <div class="toolbar"><span id="run-status" class="run-status">Idle</span><button id="refresh">Refresh clips</button></div>
 </header>
-<main><div id="clips"><p>Looking for completed clips…</p></div></main>
+<main>
+  <section id="setup" class="card">
+    <h2>Start observing and clipping</h2>
+    <form id="control-form">
+      <div class="settings-grid">
+        <label>Stream URL<input id="stream_url" name="stream_url" type="text" required placeholder="https://www.youtube.com/watch?v=…"></label>
+        <label>Chat spike multiplier<input id="chat_spike_multiplier" name="chat_spike_multiplier" type="number" min="0.1" max="20" step="0.1" required></label>
+        <label>Clip duration (seconds)<input id="clip_duration" name="clip_duration" type="number" min="5" max="180" step="1" required></label>
+        <label>Pre-roll (seconds)<input id="clip_pre_roll_seconds" name="clip_pre_roll_seconds" type="number" min="0" max="179" step="1" required></label>
+        <label>Maximum clips<input id="max_clips" name="max_clips" type="number" min="1" max="100" step="1" required></label>
+        <label>Minimum chat messages per 5s<input id="min_chat_messages" name="min_chat_messages" type="number" min="1" max="100" step="1" required></label>
+        <label>Cooldown between clips (seconds)<input id="cooldown_seconds" name="cooldown_seconds" type="number" min="0" max="3600" step="1" required></label>
+      </div>
+      <div class="buttons"><button class="primary" type="submit">Start observing and clipping</button></div>
+      <p id="control-message" class="status" role="status"></p>
+    </form>
+  </section>
+  <section id="active" class="card" hidden>
+    <h2>Monitoring stream</h2>
+    <p id="active-stream"></p>
+    <p id="active-message" class="status">Starting…</p>
+    <button id="stop" class="danger" type="button">Stop clipping</button>
+  </section>
+  <h2>Review completed clips</h2>
+  <div id="clips"><p>Looking for completed clips…</p></div>
+</main>
 <script>
 const reviewToken=__REVIEW_TOKEN__;
+const defaults=__DEFAULT_SETTINGS__;
 const clipsRoot=document.querySelector("#clips");
+const setup=document.querySelector("#setup");
+const active=document.querySelector("#active");
+const controlMessage=document.querySelector("#control-message");
+const statusNames={idle:"Idle",starting:"Starting…",observing:"Observing",stopping:"Stopping…",stopped:"Stopped",completed:"Finished",error:"Error"};
+for(const key of ["stream_url","chat_spike_multiplier","clip_duration","clip_pre_roll_seconds","max_clips","min_chat_messages","cooldown_seconds"]){
+  const input=document.querySelector("#"+key);input.value=defaults[key]??"";
+}
 async function post(path,payload){
   const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Review-Token":reviewToken},body:JSON.stringify(payload)});
   const data=await response.json();
@@ -501,6 +603,50 @@ function button(text,className,action){
   if(className)item.className=className;
   item.addEventListener("click",action);return item;
 }
+function formPayload(){
+  return{
+    stream_url:document.querySelector("#stream_url").value,
+    chat_spike_multiplier:Number(document.querySelector("#chat_spike_multiplier").value),
+    clip_duration:Number(document.querySelector("#clip_duration").value),
+    clip_pre_roll_seconds:Number(document.querySelector("#clip_pre_roll_seconds").value),
+    max_clips:Number(document.querySelector("#max_clips").value),
+    min_chat_messages:Number(document.querySelector("#min_chat_messages").value),
+    cooldown_seconds:Number(document.querySelector("#cooldown_seconds").value)
+  };
+}
+async function updateStatus(){
+  try{
+    const response=await fetch("/api/status",{cache:"no-store"});
+    if(!response.ok)throw new Error("Could not read clipper status.");
+    const state=await response.json();
+    const name=statusNames[state.status]||state.status;
+    document.querySelector("#run-status").textContent=name;
+    if(["starting","observing","stopping"].includes(state.status)){
+      setup.hidden=true;active.hidden=false;
+      document.querySelector("#active-stream").textContent=state.stream_url||"";
+      document.querySelector("#active-message").textContent=state.status==="error"?state.error:name;
+      document.querySelector("#stop").disabled=state.status==="stopping";
+    }else{
+      active.hidden=true;setup.hidden=false;
+      if(state.status==="stopped")controlMessage.textContent="Monitoring stopped. Ready to start another stream.";
+      else if(state.status==="completed")controlMessage.textContent="Run finished. Ready to start another stream.";
+      else if(state.status==="error"){controlMessage.textContent=state.error||"The clipper stopped with an error.";controlMessage.classList.add("error");}
+      else if(state.status==="idle")controlMessage.textContent="";
+    }
+  }catch(error){document.querySelector("#run-status").textContent=error.message;}
+}
+document.querySelector("#control-form").addEventListener("submit",async event=>{
+  event.preventDefault();controlMessage.textContent="Starting…";controlMessage.classList.remove("error");
+  try{await post("/api/start",formPayload());await updateStatus();}
+  catch(error){controlMessage.textContent=error.message;controlMessage.classList.add("error");}
+});
+document.querySelector("#stop").addEventListener("click",async()=>{
+  if(!confirm("Stop observing this stream? Any clip already being processed will finish."))return;
+  document.querySelector("#stop").disabled=true;
+  document.querySelector("#active-message").textContent="Stopping…";
+  try{await post("/api/stop",{});await updateStatus();}
+  catch(error){document.querySelector("#active-message").textContent=error.message;document.querySelector("#stop").disabled=false;}
+});
 async function loadClips(){
   try{
     const response=await fetch("/api/clips",{cache:"no-store"});
@@ -569,11 +715,8 @@ async function loadClips(){
   }catch(error){clipsRoot.textContent=error.message;}
 }
 document.querySelector("#refresh").addEventListener("click",loadClips);
-document.querySelector("#close").addEventListener("click",async()=>{
-  if(!confirm("Close the review page? Stream monitoring continues until its clip limit."))return;
-  await post("/api/close",{});document.body.textContent="Review closed. You may close this tab.";
-});
 loadClips();setInterval(()=>{if(!clipsRoot.contains(document.activeElement))loadClips();},8000);
+updateStatus();setInterval(updateStatus,1500);
 </script>
 </body>
 </html>

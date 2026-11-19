@@ -1,3 +1,5 @@
+import asyncio
+import base64
 import json
 import unittest
 import os
@@ -8,11 +10,14 @@ from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from live_clipper import (
     CaptionWord,
     ChatReader,
+    ClipperController,
+    ClipSettings,
     ClipPipeline,
     ConfigurationError,
     detect_platform,
@@ -57,6 +62,53 @@ class PlatformTests(unittest.TestCase):
             "video123",
         )
         self.assertEqual(streamer_name("https://youtube.com/watch?v=video123"), "video123")
+
+
+class ClipSettingsTests(unittest.TestCase):
+    def test_parses_control_values_and_rejects_invalid_preroll(self):
+        payload = {
+            "stream_url": "https://www.youtube.com/watch?v=abc",
+            "chat_spike_multiplier": 1.3,
+            "clip_duration": 45,
+            "clip_pre_roll_seconds": 12,
+            "max_clips": 5,
+            "min_chat_messages": 2,
+            "cooldown_seconds": 10,
+        }
+        settings = ClipSettings.from_payload(payload)
+        self.assertEqual(settings.stream_url, payload["stream_url"])
+        self.assertEqual(settings.clip_duration, 45)
+        self.assertEqual(settings.clip_pre_roll_seconds, 12)
+        self.assertEqual(settings.max_clips, 5)
+
+        payload["clip_pre_roll_seconds"] = 45
+        with self.assertRaisesRegex(ConfigurationError, "Pre-roll must be shorter"):
+            ClipSettings.from_payload(payload)
+
+
+class ClipperControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_and_stop_control_a_session(self):
+        controller = ClipperController(asyncio.get_running_loop())
+        settings = ClipSettings(stream_url="https://www.twitch.tv/example")
+        started = asyncio.Event()
+
+        async def fake_session(session_settings, stop_event):
+            self.assertEqual(session_settings, settings)
+            started.set()
+            await stop_event.wait()
+
+        with (
+            patch("live_clipper.validate_runtime_dependencies"),
+            patch("live_clipper.run_clip_session", side_effect=fake_session),
+        ):
+            result = await controller._start(settings)
+            self.assertEqual(result["status"], "starting")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            stop_result = await asyncio.to_thread(controller.stop)
+            self.assertEqual(stop_result["status"], "stopping")
+            await asyncio.wait_for(controller._task, timeout=1)
+
+        self.assertEqual(controller.status()["status"], "stopped")
 
 
 class YouTubeChatReaderTests(unittest.TestCase):
@@ -334,6 +386,104 @@ class MetadataResponseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClipReviewServerTests(unittest.TestCase):
+    def test_dashboard_controls_are_protected_and_reach_controller(self):
+        class FakeController:
+            def __init__(self):
+                self.started_with = None
+                self.stopped = False
+
+            def status(self):
+                return {"status": "idle", "stream_url": "", "error": ""}
+
+            def start(self, payload):
+                self.started_with = payload
+                return {"ok": True, "status": "starting"}
+
+            def stop(self):
+                self.stopped = True
+                return {"ok": True, "status": "stopping"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            controller = FakeController()
+            server = ClipReviewServer(
+                output_dir,
+                output_dir / "client-secret.json",
+                output_dir / "token.json",
+                controller=controller,
+                default_settings={
+                    "stream_url": "",
+                    "chat_spike_multiplier": 1.5,
+                    "clip_duration": 46,
+                    "clip_pre_roll_seconds": 10,
+                    "max_clips": 5,
+                    "min_chat_messages": 2,
+                    "cooldown_seconds": 10,
+                },
+                username="friend",
+                password="a-strong-password",
+            )
+            server.start()
+            try:
+                with self.assertRaises(HTTPError) as response:
+                    urlopen(server.url)
+                self.assertEqual(response.exception.code, 401)
+                self.assertEqual(
+                    response.exception.headers.get("WWW-Authenticate"),
+                    'Basic realm="StreamClipper"',
+                )
+                with urlopen(f"{server.url}healthz") as health_response:
+                    self.assertEqual(health_response.read(), b"ok")
+
+                authorization = "Basic " + base64.b64encode(
+                    b"friend:a-strong-password"
+                ).decode("ascii")
+                page_request = Request(server.url, headers={"Authorization": authorization})
+                with urlopen(page_request) as page_response:
+                    page = page_response.read().decode("utf-8")
+                self.assertIn("Start observing and clipping", page)
+                self.assertIn('id="clip_pre_roll_seconds"', page)
+
+                payload = {"stream_url": "https://www.twitch.tv/example"}
+                start_request = Request(
+                    f"{server.url}api/start",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Authorization": authorization,
+                        "Content-Type": "application/json",
+                        "X-Review-Token": server._token,
+                    },
+                )
+                with urlopen(start_request) as start_response:
+                    self.assertTrue(json.loads(start_response.read())["ok"])
+                self.assertEqual(controller.started_with, payload)
+
+                stop_request = Request(
+                    f"{server.url}api/stop",
+                    data=b"{}",
+                    headers={
+                        "Authorization": authorization,
+                        "Content-Type": "application/json",
+                        "X-Review-Token": server._token,
+                    },
+                )
+                with urlopen(stop_request) as stop_response:
+                    self.assertEqual(json.loads(stop_response.read())["status"], "stopping")
+                self.assertTrue(controller.stopped)
+            finally:
+                server.stop()
+
+    def test_public_interface_requires_dashboard_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            with self.assertRaisesRegex(ValueError, "authentication is required"):
+                ClipReviewServer(
+                    output_dir,
+                    output_dir / "client-secret.json",
+                    output_dir / "token.json",
+                    host="0.0.0.0",
+                )
+
     def test_delete_removes_local_files_but_retains_youtube_upload(self):
         with tempfile.TemporaryDirectory() as directory:
             output_dir = Path(directory)
@@ -479,6 +629,47 @@ class ClipReviewServerTests(unittest.TestCase):
 
 
 class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_event_stops_waiting_for_chat(self):
+        class FakeReader:
+            stopped = False
+
+            def start(self):
+                pass
+
+            async def next_event(self):
+                await asyncio.Future()
+
+            def stop(self):
+                self.stopped = True
+
+        class FakeCapture:
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        class FakePipeline:
+            async def create_clip(self):
+                raise AssertionError("No clip should be created when stopping while idle.")
+
+        reader = FakeReader()
+        capture = FakeCapture()
+        stop_event = asyncio.Event()
+        settings = ClipSettings(
+            chat_spike_multiplier=1.5,
+            clip_duration=10,
+            clip_pre_roll_seconds=2,
+            max_clips=2,
+        )
+        task = asyncio.create_task(
+            monitor_chat(reader, FakePipeline(), capture, settings, stop_event)
+        )
+        await asyncio.sleep(0)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1)
+        self.assertTrue(reader.stopped)
+        self.assertTrue(capture.stopped)
+
     async def test_stops_after_configured_number_of_clip_triggers(self):
         class FakeReader:
             stopped = False

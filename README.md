@@ -76,12 +76,10 @@ key. `uv run` does not load `.env` automatically unless you pass `--env-file`.
 Metadata uses Groq's OpenAI-compatible API with the `openai/gpt-oss-20b` model
 by default. Set `GROQ_MODEL` in `.env` to select another Groq-supported model.
 
-At the prompt, enter only the stream URL, for example
-`https://www.twitch.tv/Lysium` or `twitch.tv/Lysium` (the scheme is optional).
-Run shell commands such as
-`uv run --extra music-separation --extra youtube-publishing --env-file .env python .\live_clipper.py`
-at the PowerShell prompt, not inside the app's URL prompt. You can instead set
-`STREAM_URL` near the top of `live_clipper.py`.
+The app opens the StreamClipper dashboard at `http://127.0.0.1:55842/`.
+Enter a Twitch, YouTube, or Kick URL in the form and choose the chat threshold,
+clip length, pre-roll, and clip limit before starting. You can set `STREAM_URL`
+near the top of `live_clipper.py` to prefill the URL field.
 
 The app writes final MP4s, SRT files, and editable review metadata JSON files to
 `output\`. Generated title, description, and hashtags are added when speech is
@@ -93,19 +91,58 @@ The segment buffer is pruned as it ages. Initial buffering takes approximately
 the configured clip duration, and clips can only be generated after enough live
 segments have arrived.
 
+## Hosted dashboard
+
+The dashboard and clipper run together on one always-on server. Netlify and
+Vercel are not suitable for this worker: it needs to keep monitoring a stream
+and running FFmpeg for longer than a serverless request. **Render is one
+click-through option** that deploys the included Dockerfile:
+
+1. Push this repository to GitHub.
+2. In Render, choose **New → Web Service**, connect GitHub, and select this
+   repository. Render detects the root `Dockerfile`.
+3. Choose a **paid** service plan. Render's free service can sleep and has no
+   persistent disk, so monitoring would stop and files would be lost.
+4. Add a persistent disk mounted at `/app/data`.
+5. Add environment variables `STREAMCLIPPER_USERNAME`,
+   `STREAMCLIPPER_PASSWORD` (at least 16 characters), and optionally
+   `GROQ_API_KEY` for automatic metadata. The Dockerfile already sets the
+   required host and persistent-data paths. Set Render's health check path to
+   `/healthz` if configuring a health check.
+6. Deploy. Open the `https://…onrender.com` address Render gives you and share
+   that URL plus the dashboard username/password with your friend.
+
+The persistent disk stores clips, temporary stream segments, and model files.
+Keep the login credentials private; anyone with them can start/stop clipping
+and manage the clips.
+
+For a VPS instead, copy `.env.example` to `.env`, set a unique password, and run
+`docker compose up --build -d`. The Compose file binds to `127.0.0.1:8000`;
+place it behind an HTTPS-enabled reverse proxy before sharing it outside the
+server. On another container host, use the included `Dockerfile` and attach a
+persistent disk at `/app/data`.
+
+Clips, temporary stream segments, and model/token files need persistent disk
+storage. The first run may download Whisper and audio-separation models. The
+current YouTube OAuth flow is designed for a desktop browser; hosted YouTube
+publishing requires a web-based OAuth callback setup in addition to the
+dashboard.
+
 ## Review and publishing
 
-The app opens a local review page while it monitors chat. Completed clips appear
-there with editable title, description, and hashtags. Nothing is uploaded until
-you click an upload action. YouTube uploads default to **private**; choose
-unlisted or public explicitly in the review page if desired. After monitoring
-ends, the review page stays open until you close it.
+Use **Start observing and clipping** to begin and **Stop clipping** to end
+monitoring. A stop request lets an already-processing clip finish; the dashboard
+then returns to its start form. Monitoring also stops after the configured clip
+limit. Completed clips appear below the controls with editable title,
+description, and hashtags. Nothing is uploaded until you click an upload
+action. YouTube uploads default to **private**; choose unlisted or public
+explicitly in the review page if desired.
 
 To enable YouTube uploads, create a Google Cloud project, enable the YouTube
 Data API v3, and create an OAuth client ID for a Desktop app. Download its JSON
 file as `youtube_client_secret.json` in the project root. That file is ignored
-by Git. The first YouTube upload opens Google's consent flow; the resulting
-token is stored under `%LOCALAPPDATA%\live-stream-clipper\`.
+by Git. The first desktop YouTube upload opens Google's consent flow; the
+resulting token is stored under `%LOCALAPPDATA%\live-stream-clipper\`.
 
 Instagram direct publishing is not enabled. The review page's Instagram action
 saves the details, copies the caption, and opens Instagram for manual upload.
@@ -142,14 +179,14 @@ controls.
 
 Edit the constants near the top of `live_clipper.py`:
 
-- `STREAM_URL`: set a URL, or leave empty for runtime input
+- `STREAM_URL`: prefill the dashboard's stream URL field
 - `CHAT_WINDOW_SECONDS`: burst window used to measure recent chat speed (5 seconds by default)
 - `CHAT_BASELINE_SECONDS`: recent history used as the normal chat-rate baseline (300 seconds)
-- `CHAT_SPIKE_MULTIPLIER`: how many times faster chat must be than its baseline (1.3 by default)
+- `CHAT_SPIKE_MULTIPLIER`: how many times faster chat must be than its baseline (1.5 by default)
 - `CHAT_SPIKE_MIN_MESSAGES`: minimum messages in the burst window, even when baseline chat is quiet (2 by default)
-- `CLIP_DURATION`: total clip length (45 seconds by default)
-- `CLIP_PRE_ROLL_SECONDS`: how many seconds before the detected spike to include (12 by default)
-- `COOLDOWN_PERIOD`: minimum seconds between spike triggers
+- `CLIP_DURATION`: total clip length (46 seconds by default)
+- `CLIP_PRE_ROLL_SECONDS`: how many seconds before the detected spike to include (10 by default)
+- `COOLDOWN_PERIOD`: minimum seconds between spike triggers (10 seconds by default)
 - `MAX_CLIPS_PER_RUN`: maximum clip attempts before the app stops (currently `5`)
 - `WHISPER_MODEL_SIZE`: `small` or `base`
 - `VOICE_ONLY_AUDIO`: enable best-effort local vocal-stem processing

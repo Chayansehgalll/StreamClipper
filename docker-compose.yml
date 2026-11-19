@@ -1,0 +1,17 @@
+services:
+  streamclipper:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: 8000
+      STREAMCLIPPER_DATA_DIR: /app/data
+      LOCALAPPDATA: /app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - clipper-data:/app/data
+
+volumes:
+  clipper-data:

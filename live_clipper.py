@@ -5,6 +5,7 @@ Quick start:
     2. Install Python dependencies: uv sync --extra music-separation
     3. Set GROQ_API_KEY in the project .env file.
     4. Run: uv run --extra music-separation --env-file .env python live_clipper.py
+    5. Open the dashboard and enter the stream URL to start clipping.
 
 Only use this with streams you own or are authorized to capture and republish.
 This tool does not bypass DRM, access controls, or platform restrictions.
@@ -27,7 +28,7 @@ import threading
 import time
 import webbrowser
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
@@ -40,10 +41,10 @@ from review_server import ClipReviewServer
 
 
 # Configuration
-STREAM_URL = ""  # Leave empty to enter a URL when the program starts.
+STREAM_URL = ""  # Optional URL prefilled in the dashboard.
 CHAT_WINDOW_SECONDS = 5
 CHAT_BASELINE_SECONDS = 300
-CHAT_SPIKE_MULTIPLIER = 2.5
+CHAT_SPIKE_MULTIPLIER = 1.5
 CHAT_SPIKE_MIN_MESSAGES = 2
 CLIP_DURATION = 46
 CLIP_PRE_ROLL_SECONDS = 10
@@ -67,8 +68,9 @@ FACECAM_CROP_HEIGHT = 0.32
 FACECAM_OUTPUT_WIDTH = 480
 FACECAM_MARGIN = 40
 ROOT_DIR = Path(__file__).resolve().parent
-TEMP_DIR = ROOT_DIR / "temp"
-OUTPUT_DIR = ROOT_DIR / "output"
+DATA_DIR = Path(os.getenv("STREAMCLIPPER_DATA_DIR", str(ROOT_DIR))).resolve()
+TEMP_DIR = DATA_DIR / "temp"
+OUTPUT_DIR = DATA_DIR / "output"
 YOUTUBE_CLIENT_SECRETS_FILE = ROOT_DIR / "youtube_client_secret.json"
 YOUTUBE_TOKEN_FILE = (
     Path(os.getenv("LOCALAPPDATA", str(Path.home())))
@@ -107,6 +109,61 @@ LOGGER = logging.getLogger("live-clipper")
 
 class ConfigurationError(RuntimeError):
     """Raised when an input or required local dependency is unavailable."""
+
+
+@dataclass(frozen=True)
+class ClipSettings:
+    stream_url: str = STREAM_URL
+    chat_spike_multiplier: float = CHAT_SPIKE_MULTIPLIER
+    clip_duration: int = CLIP_DURATION
+    clip_pre_roll_seconds: int = CLIP_PRE_ROLL_SECONDS
+    max_clips: int = MAX_CLIPS_PER_RUN
+    min_chat_messages: int = CHAT_SPIKE_MIN_MESSAGES
+    cooldown_seconds: int = COOLDOWN_PERIOD
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> ClipSettings:
+        stream_url = payload.get("stream_url")
+        if not isinstance(stream_url, str) or not stream_url.strip():
+            raise ConfigurationError("Enter a Twitch, YouTube, or Kick stream URL.")
+        stream_url = stream_url.strip()
+        if len(stream_url) > 2048:
+            raise ConfigurationError("Stream URL must be at most 2048 characters.")
+        detect_platform(stream_url)
+
+        multiplier_value = payload.get("chat_spike_multiplier")
+        if isinstance(multiplier_value, bool):
+            raise ConfigurationError("Chat spike multiplier must be a number.")
+        try:
+            multiplier = float(multiplier_value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError("Chat spike multiplier must be a number.") from exc
+        if not math.isfinite(multiplier) or not 0.1 <= multiplier <= 20:
+            raise ConfigurationError("Chat spike multiplier must be between 0.1 and 20.")
+
+        settings = cls(
+            stream_url=stream_url,
+            chat_spike_multiplier=multiplier,
+            clip_duration=_int_setting(payload, "clip_duration", 5, 180),
+            clip_pre_roll_seconds=_int_setting(payload, "clip_pre_roll_seconds", 0, 179),
+            max_clips=_int_setting(payload, "max_clips", 1, 100),
+            min_chat_messages=_int_setting(payload, "min_chat_messages", 1, 100),
+            cooldown_seconds=_int_setting(payload, "cooldown_seconds", 0, 3600),
+        )
+        if settings.clip_pre_roll_seconds >= settings.clip_duration:
+            raise ConfigurationError("Pre-roll must be shorter than the total clip duration.")
+        return settings
+
+
+def _int_setting(payload: dict[str, Any], key: str, minimum: int, maximum: int) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigurationError(f"{key.replace('_', ' ').capitalize()} must be a whole number.")
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(
+            f"{key.replace('_', ' ').capitalize()} must be between {minimum} and {maximum}."
+        )
+    return value
 
 
 def detect_platform(url: str) -> str:
@@ -216,7 +273,13 @@ def is_chat_spike(
     message_times: deque[float],
     now: float,
     monitoring_started_at: float,
+    spike_multiplier: float | None = None,
+    minimum_messages: int | None = None,
 ) -> tuple[bool, int, int, float]:
+    if spike_multiplier is None:
+        spike_multiplier = CHAT_SPIKE_MULTIPLIER
+    if minimum_messages is None:
+        minimum_messages = CHAT_SPIKE_MIN_MESSAGES
     recent_cutoff = now - CHAT_WINDOW_SECONDS
     baseline_start = max(monitoring_started_at, now - CHAT_BASELINE_SECONDS)
     baseline_duration = max(0.0, recent_cutoff - baseline_start)
@@ -231,8 +294,8 @@ def is_chat_spike(
         else 0
     )
     threshold = max(
-        CHAT_SPIKE_MIN_MESSAGES,
-        math.ceil(CHAT_SPIKE_MULTIPLIER * baseline_expected),
+        minimum_messages,
+        math.ceil(spike_multiplier * baseline_expected),
     )
     return recent_count >= threshold, recent_count, threshold, baseline_expected
 
@@ -326,8 +389,9 @@ class ChatReader:
 class RollingStreamCapture:
     """Capture Streamlink output into a bounded rolling set of MPEG-TS segments."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, clip_duration: int = CLIP_DURATION) -> None:
         self.url = url
+        self.clip_duration = clip_duration
         self.stop_event = asyncio.Event()
         self._segment_lock = asyncio.Lock()
         self._stderr_tasks: list[asyncio.Task[None]] = []
@@ -487,7 +551,7 @@ class RollingStreamCapture:
                 backoff = min(backoff * 2, 30)
 
     async def _prune_segments(self) -> None:
-        cutoff = time.time() - CLIP_DURATION - 20
+        cutoff = time.time() - self.clip_duration - 20
         async with self._segment_lock:
             for path in SEGMENT_DIR.glob(SEGMENT_PATTERN):
                 try:
@@ -502,7 +566,7 @@ class RollingStreamCapture:
 
         cutoff = max(
             self._buffer_started_at,
-            time.time() - CLIP_DURATION - SEGMENT_SECONDS,
+            time.time() - self.clip_duration - SEGMENT_SECONDS,
         )
         async with self._segment_lock:
             timestamps = []
@@ -517,7 +581,7 @@ class RollingStreamCapture:
         if len(timestamps) < 2:
             return False
         buffered_seconds = max(timestamps) - min(timestamps) + SEGMENT_SECONDS
-        return buffered_seconds >= CLIP_DURATION
+        return buffered_seconds >= self.clip_duration
 
     async def _prune_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -534,7 +598,7 @@ class RollingStreamCapture:
                 SEGMENT_DIR.glob(SEGMENT_PATTERN),
                 key=lambda path: path.stat().st_mtime,
             )
-            cutoff = time.time() - CLIP_DURATION - SEGMENT_SECONDS
+            cutoff = time.time() - self.clip_duration - SEGMENT_SECONDS
             paths = [path for path in paths if path.stat().st_mtime >= cutoff]
             if not paths:
                 raise RuntimeError("No buffered stream segments are available yet.")
@@ -565,7 +629,7 @@ class RollingStreamCapture:
             "-i",
             str(concat_file),
             "-t",
-            str(CLIP_DURATION),
+            str(self.clip_duration),
             "-map",
             "0:v:0",
             "-map",
@@ -1297,12 +1361,23 @@ async def monitor_chat(
     reader: ChatReader,
     pipeline: ClipPipeline,
     capture: RollingStreamCapture,
+    settings: ClipSettings | None = None,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
-    if MAX_CLIPS_PER_RUN < 1:
-        raise ConfigurationError("MAX_CLIPS_PER_RUN must be at least 1.")
-    if not 0 <= CLIP_PRE_ROLL_SECONDS < CLIP_DURATION:
+    settings = settings or ClipSettings(
+        stream_url=getattr(reader, "url", ""),
+        chat_spike_multiplier=CHAT_SPIKE_MULTIPLIER,
+        clip_duration=CLIP_DURATION,
+        clip_pre_roll_seconds=CLIP_PRE_ROLL_SECONDS,
+        max_clips=MAX_CLIPS_PER_RUN,
+        min_chat_messages=CHAT_SPIKE_MIN_MESSAGES,
+        cooldown_seconds=COOLDOWN_PERIOD,
+    )
+    if settings.max_clips < 1:
+        raise ConfigurationError("The clip limit must be at least 1.")
+    if not 0 <= settings.clip_pre_roll_seconds < settings.clip_duration:
         raise ConfigurationError(
-            "CLIP_PRE_ROLL_SECONDS must be non-negative and shorter than CLIP_DURATION."
+            "Pre-roll must be non-negative and shorter than the total clip duration."
         )
 
     message_times: deque[float] = deque()
@@ -1319,21 +1394,44 @@ async def monitor_chat(
         if not task.cancelled() and task.exception() is not None:
             LOGGER.error("Clip task ended with an error: %s", task.exception())
 
+    async def next_event_or_stop() -> tuple[str, Any] | None:
+        if stop_event is None:
+            return await reader.next_event()
+        event_task = asyncio.create_task(reader.next_event())
+        stop_task = asyncio.create_task(stop_event.wait())
+        done, _ = await asyncio.wait(
+            (event_task, stop_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done and stop_event.is_set():
+            if not event_task.done():
+                event_task.cancel()
+            await asyncio.gather(event_task, return_exceptions=True)
+            return None
+        stop_task.cancel()
+        await asyncio.gather(stop_task, return_exceptions=True)
+        return event_task.result()
+
     reader.start()
     LOGGER.info(
         "Watching chat for fast activity: trigger at %.1fx usual rate or at least "
         "%d messages in %ds; clips are %ds total with %ds before the spike; "
         "maximum %d clips.",
-        CHAT_SPIKE_MULTIPLIER,
-        CHAT_SPIKE_MIN_MESSAGES,
+        settings.chat_spike_multiplier,
+        settings.min_chat_messages,
         CHAT_WINDOW_SECONDS,
-        CLIP_DURATION,
-        CLIP_PRE_ROLL_SECONDS,
-        MAX_CLIPS_PER_RUN,
+        settings.clip_duration,
+        settings.clip_pre_roll_seconds,
+        settings.max_clips,
     )
     try:
-        while clips_started < MAX_CLIPS_PER_RUN:
-            kind, value = await reader.next_event()
+        while clips_started < settings.max_clips:
+            event = await next_event_or_stop()
+            if event is None:
+                break
+            kind, value = event
+            if stop_event is not None and stop_event.is_set():
+                break
             if kind == "end":
                 raise RuntimeError("Chat connection ended.")
             if kind == "error":
@@ -1347,6 +1445,8 @@ async def monitor_chat(
                 message_times,
                 now,
                 monitoring_started_at,
+                settings.chat_spike_multiplier,
+                settings.min_chat_messages,
             )
             if not spike:
                 spike_active = False
@@ -1379,13 +1479,13 @@ async def monitor_chat(
             if (
                 spike
                 and not spike_active
-                and now - last_trigger >= COOLDOWN_PERIOD
+                and now - last_trigger >= settings.cooldown_seconds
             ):
                 if not await capture.has_full_buffer():
                     if not buffer_wait_logged:
                         LOGGER.info(
                             "Building the %d-second stream buffer; clips can start once it is ready.",
-                            CLIP_DURATION,
+                            settings.clip_duration,
                         )
                         buffer_wait_logged = True
                     continue
@@ -1394,7 +1494,19 @@ async def monitor_chat(
                     buffer_wait_logged = False
 
                 async def create_spike_clip() -> None:
-                    await asyncio.sleep(CLIP_DURATION - CLIP_PRE_ROLL_SECONDS)
+                    wait_seconds = settings.clip_duration - settings.clip_pre_roll_seconds
+                    if stop_event is None:
+                        await asyncio.sleep(wait_seconds)
+                    else:
+                        try:
+                            await asyncio.wait_for(
+                                stop_event.wait(),
+                                timeout=wait_seconds,
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                        if stop_event.is_set():
+                            return
                     await pipeline.create_clip()
 
                 last_trigger = now
@@ -1409,22 +1521,19 @@ async def monitor_chat(
                 tasks.add(task)
                 clips_started += 1
                 task.add_done_callback(completed)
-                if clips_started == MAX_CLIPS_PER_RUN:
+                if clips_started == settings.max_clips:
                     LOGGER.info(
                         "Per-run clip limit reached (%d); stopping chat monitoring.",
-                        MAX_CLIPS_PER_RUN,
+                        settings.max_clips,
                     )
     finally:
         reader.stop()
+        capture.stop()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        capture.stop()
 
 
-async def run_application(url: str) -> None:
-    if "://" not in url:
-        url = f"https://{url.strip()}"
-    platform = detect_platform(url)
+def validate_runtime_dependencies() -> None:
     ensure_ffmpeg_on_path()
     missing_programs = [
         name for name in ("streamlink", "ffmpeg") if shutil.which(name) is None
@@ -1443,11 +1552,18 @@ async def run_application(url: str) -> None:
             f"Required executable(s) not found on PATH: {missing_list}. "
             "Run 'uv sync' for Streamlink and install FFmpeg separately."
         )
+
+
+async def run_clip_session(settings: ClipSettings, stop_event: asyncio.Event) -> None:
+    url = settings.stream_url
+    if "://" not in url:
+        url = f"https://{url}"
+    platform = detect_platform(url)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     LOGGER.info("Detected %s URL; channel=%s.", platform, streamer_name(url))
-    capture = RollingStreamCapture(url)
+    capture = RollingStreamCapture(url, settings.clip_duration)
     reader = ChatReader(url)
     pipeline = ClipPipeline(
         capture=capture,
@@ -1455,41 +1571,145 @@ async def run_application(url: str) -> None:
         metadata=MetadataGenerator(GROQ_API_KEY, GROQ_MODEL),
         channel=streamer_name(url),
     )
+    capture_task = asyncio.create_task(capture.run(), name="stream-capture")
+    try:
+        await monitor_chat(reader, pipeline, capture, settings, stop_event)
+    finally:
+        reader.stop()
+        capture.stop()
+        if not capture_task.done():
+            capture_task.cancel()
+        await asyncio.gather(capture_task, return_exceptions=True)
+
+
+class ClipperController:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+        self._lock = threading.Lock()
+        self._task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
+        self._state: dict[str, Any] = {"status": "idle", "stream_url": "", "error": ""}
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._state)
+
+    def start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = ClipSettings.from_payload(payload)
+        future = asyncio.run_coroutine_threadsafe(self._start(settings), self.loop)
+        try:
+            return future.result(timeout=10)
+        except TimeoutError as exc:
+            future.cancel()
+            raise RuntimeError("Could not start the clipper; check the server logs.") from exc
+
+    async def _start(self, settings: ClipSettings) -> dict[str, Any]:
+        if self._task is not None and not self._task.done():
+            raise RuntimeError("A stream is already being monitored.")
+        self._stop_event = asyncio.Event()
+        with self._lock:
+            self._state = {
+                "status": "starting",
+                "stream_url": settings.stream_url,
+                "settings": asdict(settings),
+                "error": "",
+            }
+        self._task = asyncio.create_task(
+            self._run(settings, self._stop_event),
+            name="clipper-session",
+        )
+        return {"ok": True, "status": "starting"}
+
+    async def _run(self, settings: ClipSettings, stop_event: asyncio.Event) -> None:
+        try:
+            validate_runtime_dependencies()
+            if stop_event.is_set():
+                with self._lock:
+                    self._state["status"] = "stopped"
+                return
+            with self._lock:
+                self._state["status"] = "observing"
+            await run_clip_session(settings, stop_event)
+            final_status = "stopped" if stop_event.is_set() else "completed"
+            with self._lock:
+                self._state["status"] = final_status
+        except Exception as exc:
+            LOGGER.exception("Clipper session failed.")
+            with self._lock:
+                self._state["status"] = "error"
+                self._state["error"] = str(exc)
+
+    def stop(self) -> dict[str, Any]:
+        future = asyncio.run_coroutine_threadsafe(self._request_stop(), self.loop)
+        try:
+            return future.result(timeout=10)
+        except TimeoutError as exc:
+            future.cancel()
+            raise RuntimeError("Could not stop the clipper; check the server logs.") from exc
+
+    async def _request_stop(self) -> dict[str, Any]:
+        if self._task is None or self._task.done():
+            return {"ok": True, "status": self.status()["status"]}
+        with self._lock:
+            self._state["status"] = "stopping"
+        if self._stop_event is not None:
+            self._stop_event.set()
+        return {"ok": True, "status": "stopping"}
+
+    async def shutdown(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._task is not None:
+            await self._task
+
+
+async def run_dashboard() -> None:
+    host = os.getenv("WEB_HOST", "127.0.0.1")
+    username = os.getenv("STREAMCLIPPER_USERNAME", "")
+    password = os.getenv("STREAMCLIPPER_PASSWORD", "")
+    if host not in {"127.0.0.1", "localhost", "::1"} and not (username and password):
+        raise ConfigurationError(
+            "Set STREAMCLIPPER_USERNAME and STREAMCLIPPER_PASSWORD before binding "
+            "the dashboard to a public interface."
+        )
+    try:
+        port = int(os.getenv("PORT", os.getenv("WEB_PORT", "55842")))
+    except ValueError as exc:
+        raise ConfigurationError("PORT or WEB_PORT must be a valid port number.") from exc
+    if not 0 <= port <= 65535:
+        raise ConfigurationError("PORT or WEB_PORT must be between 0 and 65535.")
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    controller = ClipperController(asyncio.get_running_loop())
     review_server = ClipReviewServer(
         OUTPUT_DIR,
         YOUTUBE_CLIENT_SECRETS_FILE,
         YOUTUBE_TOKEN_FILE,
+        controller=controller,
+        default_settings=asdict(ClipSettings()),
+        username=username,
+        password=password,
+        host=host,
+        port=port,
     )
     review_server.start()
-    LOGGER.info("Clip review page: %s", review_server.url)
+    LOGGER.info("StreamClipper dashboard: %s", review_server.url)
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        try:
+            webbrowser.open(review_server.url, new=2)
+        except (webbrowser.Error, OSError):
+            LOGGER.exception("Could not open the dashboard automatically.")
     try:
-        review_page_opened = webbrowser.open(review_server.url, new=2)
-    except (webbrowser.Error, OSError):
-        LOGGER.exception("Could not open the review page automatically.")
-        review_page_opened = False
-    if not review_page_opened:
-        LOGGER.warning("Could not open the review page automatically: %s", review_server.url)
-    capture_task = asyncio.create_task(capture.run(), name="stream-capture")
-    try:
-        await monitor_chat(reader, pipeline, capture)
-        capture.stop()
-        if not capture_task.done():
-            capture_task.cancel()
-        await asyncio.gather(capture_task, return_exceptions=True)
-        LOGGER.info("Review completed clips at %s; close the page to exit.", review_server.url)
         await asyncio.to_thread(review_server.wait_until_closed)
     finally:
-        capture.stop()
-        if not capture_task.done():
-            capture_task.cancel()
-        await asyncio.gather(capture_task, return_exceptions=True)
+        await controller.shutdown()
         review_server.stop()
 
 
 def main() -> None:
-    url = STREAM_URL.strip() or input("Enter a Twitch, YouTube Live, or Kick URL: ").strip()
     try:
-        asyncio.run(run_application(url))
+        asyncio.run(run_dashboard())
     except KeyboardInterrupt:
         LOGGER.info("Stopped by user.")
     except ConfigurationError as exc:
