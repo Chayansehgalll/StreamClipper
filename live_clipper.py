@@ -38,9 +38,12 @@ from urllib.request import urlopen
 
 # Configuration
 STREAM_URL = ""  # Leave empty to enter a URL when the program starts.
-CHAT_THRESHOLD = 1  # Messages seen in the sliding CHAT_WINDOW_SECONDS.
 CHAT_WINDOW_SECONDS = 5
-CLIP_DURATION = 40
+CHAT_BASELINE_SECONDS = 300
+CHAT_SPIKE_MULTIPLIER = 1.3
+CHAT_SPIKE_MIN_MESSAGES = 2
+CLIP_DURATION = 45
+CLIP_PRE_ROLL_SECONDS = 12
 COOLDOWN_PERIOD = 10
 WHISPER_MODEL_SIZE = "small"  # "small" or "base"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -48,7 +51,7 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 SEGMENT_SECONDS = 1
 MAX_CONCURRENT_CLIPS = 2
-MAX_CLIPS_PER_RUN = 3
+MAX_CLIPS_PER_RUN = 5
 VOICE_ONLY_AUDIO = True
 VOICE_STEM_MODEL = "UVR_MDXNET_KARA_2.onnx"
 GAMEPLAY_CROP_FOCUS_X = 0.5
@@ -196,6 +199,31 @@ def message_timestamp(message: dict[str, Any]) -> float:
     elif stamp > 1e11:
         stamp /= 1_000
     return stamp
+
+
+def is_chat_spike(
+    message_times: deque[float],
+    now: float,
+    monitoring_started_at: float,
+) -> tuple[bool, int, int, float]:
+    recent_cutoff = now - CHAT_WINDOW_SECONDS
+    baseline_start = max(monitoring_started_at, now - CHAT_BASELINE_SECONDS)
+    baseline_duration = max(0.0, recent_cutoff - baseline_start)
+    recent_count = sum(timestamp >= recent_cutoff for timestamp in message_times)
+    baseline_count = sum(
+        baseline_start <= timestamp < recent_cutoff
+        for timestamp in message_times
+    )
+    baseline_expected = (
+        baseline_count * CHAT_WINDOW_SECONDS / baseline_duration
+        if baseline_duration > 0
+        else 0
+    )
+    threshold = max(
+        CHAT_SPIKE_MIN_MESSAGES,
+        math.ceil(CHAT_SPIKE_MULTIPLIER * baseline_expected),
+    )
+    return recent_count >= threshold, recent_count, threshold, baseline_expected
 
 
 class ChatReader:
@@ -1249,9 +1277,16 @@ async def monitor_chat(
 ) -> None:
     if MAX_CLIPS_PER_RUN < 1:
         raise ConfigurationError("MAX_CLIPS_PER_RUN must be at least 1.")
+    if not 0 <= CLIP_PRE_ROLL_SECONDS < CLIP_DURATION:
+        raise ConfigurationError(
+            "CLIP_PRE_ROLL_SECONDS must be non-negative and shorter than CLIP_DURATION."
+        )
 
-    timestamps: deque[float] = deque()
+    message_times: deque[float] = deque()
+    monitoring_started_at = time.monotonic()
     last_trigger = float("-inf")
+    last_activity_log = float("-inf")
+    spike_active = False
     clips_started = 0
     buffer_wait_logged = False
     tasks: set[asyncio.Task[None]] = set()
@@ -1263,9 +1298,13 @@ async def monitor_chat(
 
     reader.start()
     LOGGER.info(
-        "Monitoring chat: threshold=%d messages/%ds; cooldown=%ds; clip limit=%d.",
-        CHAT_THRESHOLD,
+        "Monitoring chat: spike=%.1fx baseline (minimum %d messages/%ds); "
+        "clip=%ds with %ds pre-roll; cooldown=%ds; clip limit=%d.",
+        CHAT_SPIKE_MULTIPLIER,
+        CHAT_SPIKE_MIN_MESSAGES,
         CHAT_WINDOW_SECONDS,
+        CLIP_DURATION,
+        CLIP_PRE_ROLL_SECONDS,
         COOLDOWN_PERIOD,
         MAX_CLIPS_PER_RUN,
     )
@@ -1276,14 +1315,37 @@ async def monitor_chat(
                 raise RuntimeError("Chat connection ended.")
             if kind == "error":
                 raise RuntimeError(f"Chat reader failed: {value}") from value
-            timestamp = message_timestamp(value)
-            timestamps.append(timestamp)
-            cutoff = time.time() - CHAT_WINDOW_SECONDS
-            while timestamps and timestamps[0] < cutoff:
-                timestamps.popleft()
+            now = time.monotonic()
+            message_times.append(now)
+            baseline_cutoff = now - CHAT_BASELINE_SECONDS
+            while message_times and message_times[0] < baseline_cutoff:
+                message_times.popleft()
+            spike, recent_count, threshold, baseline_expected = is_chat_spike(
+                message_times,
+                now,
+                monitoring_started_at,
+            )
+            if not spike:
+                spike_active = False
+            if now - last_activity_log >= 10:
+                usual_rate = (
+                    f"{recent_count / baseline_expected:.1f}x usual "
+                    f"(baseline {baseline_expected:.1f}/{CHAT_WINDOW_SECONDS}s)"
+                    if baseline_expected > 0
+                    else "usual rate unavailable (no prior chat messages)"
+                )
+                LOGGER.info(
+                    "Chat activity: %d messages/%ds; %s; spike threshold=%d.",
+                    recent_count,
+                    CHAT_WINDOW_SECONDS,
+                    usual_rate,
+                    threshold,
+                )
+                last_activity_log = now
             if (
-                len(timestamps) >= CHAT_THRESHOLD
-                and time.monotonic() - last_trigger >= COOLDOWN_PERIOD
+                spike
+                and not spike_active
+                and now - last_trigger >= COOLDOWN_PERIOD
             ):
                 if not await capture.has_full_buffer():
                     if not buffer_wait_logged:
@@ -1296,9 +1358,20 @@ async def monitor_chat(
                 if buffer_wait_logged:
                     LOGGER.info("Stream buffer is ready; chat triggers are enabled.")
                     buffer_wait_logged = False
-                last_trigger = time.monotonic()
-                LOGGER.info("Chat spike: %d messages in the last %d seconds.", len(timestamps), CHAT_WINDOW_SECONDS)
-                task = asyncio.create_task(pipeline.create_clip())
+
+                async def create_spike_clip() -> None:
+                    await asyncio.sleep(CLIP_DURATION - CLIP_PRE_ROLL_SECONDS)
+                    await pipeline.create_clip()
+
+                last_trigger = now
+                spike_active = True
+                LOGGER.info(
+                    "Chat spike: %d messages in %ds (threshold %d).",
+                    recent_count,
+                    CHAT_WINDOW_SECONDS,
+                    threshold,
+                )
+                task = asyncio.create_task(create_spike_clip())
                 tasks.add(task)
                 clips_started += 1
                 task.add_done_callback(completed)
@@ -1309,9 +1382,9 @@ async def monitor_chat(
                     )
     finally:
         reader.stop()
-        capture.stop()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        capture.stop()
 
 
 async def run_application(url: str) -> None:

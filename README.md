@@ -122,11 +122,14 @@ controls.
 Edit the constants near the top of `live_clipper.py`:
 
 - `STREAM_URL`: set a URL, or leave empty for runtime input
-- `CHAT_THRESHOLD`: messages per `CHAT_WINDOW_SECONDS` to trigger a clip
-- `CHAT_WINDOW_SECONDS`: sliding window used to count chat messages (currently 1 second)
-- `CLIP_DURATION`: recent segment duration to include
+- `CHAT_WINDOW_SECONDS`: burst window used to measure recent chat speed (5 seconds by default)
+- `CHAT_BASELINE_SECONDS`: recent history used as the normal chat-rate baseline (300 seconds)
+- `CHAT_SPIKE_MULTIPLIER`: how many times faster chat must be than its baseline (1.3 by default)
+- `CHAT_SPIKE_MIN_MESSAGES`: minimum messages in the burst window, even when baseline chat is quiet (2 by default)
+- `CLIP_DURATION`: total clip length (45 seconds by default)
+- `CLIP_PRE_ROLL_SECONDS`: how many seconds before the detected spike to include (12 by default)
 - `COOLDOWN_PERIOD`: minimum seconds between spike triggers
-- `MAX_CLIPS_PER_RUN`: maximum clip attempts before the app stops (currently `3`)
+- `MAX_CLIPS_PER_RUN`: maximum clip attempts before the app stops (currently `5`)
 - `WHISPER_MODEL_SIZE`: `small` or `base`
 - `VOICE_ONLY_AUDIO`: enable best-effort local vocal-stem processing
 - `VOICE_STEM_MODEL`: audio-separation model used for the vocal stem
@@ -141,6 +144,10 @@ Edit the constants near the top of `live_clipper.py`:
 
 The rolling buffer is assembled from short MPEG-TS segments; segment boundaries
 are constrained by the live stream's keyframes, so clip edges may vary slightly.
+When chat activity reaches the adaptive spike threshold, the app waits long
+enough to capture the configured total clip length with its pre-roll included.
+Periodic chat activity logs report the current rate as a multiple of the recent
+baseline; the ratio is unavailable until prior chat messages establish a baseline.
 
 Run the focused tests with:
 

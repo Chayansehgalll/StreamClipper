@@ -4,6 +4,7 @@ import os
 import threading
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -16,6 +17,7 @@ from live_clipper import (
     detect_platform,
     ensure_ffmpeg_on_path,
     format_subtitles,
+    is_chat_spike,
     message_timestamp,
     MetadataGenerator,
     monitor_chat,
@@ -351,12 +353,16 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
         capture = FakeCapture()
         with (
             patch("live_clipper.MAX_CLIPS_PER_RUN", 1),
-            patch("live_clipper.CHAT_THRESHOLD", 1),
+            patch("live_clipper.CHAT_SPIKE_MIN_MESSAGES", 1),
             patch("live_clipper.CHAT_WINDOW_SECONDS", 5),
             patch("live_clipper.COOLDOWN_PERIOD", 0),
+            patch("live_clipper.CLIP_DURATION", 1),
+            patch("live_clipper.CLIP_PRE_ROLL_SECONDS", 0),
+            patch("live_clipper.asyncio.sleep", new_callable=AsyncMock) as sleep,
         ):
             await monitor_chat(reader, pipeline, capture)
 
+        sleep.assert_awaited_once_with(1)
         self.assertEqual(pipeline.clips_started, 1)
         self.assertTrue(reader.stopped)
         self.assertTrue(capture.stopped)
@@ -401,15 +407,119 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
         capture = FakeCapture()
         with (
             patch("live_clipper.MAX_CLIPS_PER_RUN", 1),
-            patch("live_clipper.CHAT_THRESHOLD", 1),
+            patch("live_clipper.CHAT_SPIKE_MIN_MESSAGES", 1),
             patch("live_clipper.CHAT_WINDOW_SECONDS", 5),
             patch("live_clipper.COOLDOWN_PERIOD", 0),
+            patch("live_clipper.CLIP_DURATION", 1),
+            patch("live_clipper.CLIP_PRE_ROLL_SECONDS", 0),
+            patch("live_clipper.asyncio.sleep", new_callable=AsyncMock),
         ):
             await monitor_chat(reader, pipeline, capture)
 
         self.assertEqual(pipeline.clips_started, 1)
         self.assertTrue(reader.stopped)
         self.assertTrue(capture.stopped)
+
+    async def test_schedules_only_one_clip_for_a_sustained_spike(self):
+        class FakeReader:
+            stopped = False
+            events = iter(
+                [
+                    ("message", {"timestamp": time.time()}),
+                    ("message", {"timestamp": time.time()}),
+                    ("end", None),
+                ]
+            )
+
+            def start(self):
+                pass
+
+            async def next_event(self):
+                return next(self.events)
+
+            def stop(self):
+                self.stopped = True
+
+        class FakePipeline:
+            clips_started = 0
+
+            async def create_clip(self):
+                self.clips_started += 1
+
+        class FakeCapture:
+            stopped = False
+
+            async def has_full_buffer(self):
+                return True
+
+            def stop(self):
+                self.stopped = True
+
+        reader = FakeReader()
+        pipeline = FakePipeline()
+        capture = FakeCapture()
+        with (
+            patch("live_clipper.MAX_CLIPS_PER_RUN", 5),
+            patch("live_clipper.CHAT_SPIKE_MIN_MESSAGES", 1),
+            patch("live_clipper.CHAT_WINDOW_SECONDS", 5),
+            patch("live_clipper.COOLDOWN_PERIOD", 0),
+            patch("live_clipper.CLIP_DURATION", 1),
+            patch("live_clipper.CLIP_PRE_ROLL_SECONDS", 0),
+            patch("live_clipper.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            with self.assertRaises(RuntimeError):
+                await monitor_chat(reader, pipeline, capture)
+
+        self.assertEqual(pipeline.clips_started, 1)
+        self.assertTrue(reader.stopped)
+        self.assertTrue(capture.stopped)
+
+
+class ChatSpikeTests(unittest.TestCase):
+    def test_requires_minimum_burst_when_no_baseline_messages_exist(self):
+        spike, count, threshold, baseline_expected = is_chat_spike(
+            deque([4.5, 4.9]),
+            now=5.0,
+            monitoring_started_at=0.0,
+        )
+        self.assertTrue(spike)
+        self.assertEqual((count, threshold, baseline_expected), (2, 2, 0))
+
+        spike, count, threshold, baseline_expected = is_chat_spike(
+            deque([4.9]),
+            now=5.0,
+            monitoring_started_at=0.0,
+        )
+        self.assertFalse(spike)
+        self.assertEqual((count, threshold, baseline_expected), (1, 2, 0))
+
+    def test_requires_three_times_the_recent_baseline_rate(self):
+        with (
+            patch("live_clipper.CHAT_SPIKE_MIN_MESSAGES", 5),
+            patch("live_clipper.CHAT_SPIKE_MULTIPLIER", 3),
+        ):
+            baseline = deque(float(index) for index in range(60))
+            below_threshold = baseline + deque(
+                60.1 + index * 0.3 for index in range(10)
+            )
+            spike, count, threshold, baseline_expected = is_chat_spike(
+                below_threshold,
+                now=65.0,
+                monitoring_started_at=0.0,
+            )
+            self.assertFalse(spike)
+            self.assertEqual((count, threshold, baseline_expected), (10, 15, 5))
+
+            burst = baseline + deque(
+                60.1 + index * 0.3 for index in range(16)
+            )
+            spike, count, threshold, baseline_expected = is_chat_spike(
+                burst,
+                now=65.0,
+                monitoring_started_at=0.0,
+            )
+            self.assertTrue(spike)
+            self.assertEqual((count, threshold, baseline_expected), (16, 15, 5))
 
 
 class SilentClipTests(unittest.IsolatedAsyncioTestCase):
