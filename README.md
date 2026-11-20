@@ -48,16 +48,16 @@ ffmpeg -version
 ```
 
 This PATH change lasts for the current PowerShell window. Install the Python
-dependencies, including the optional CPU audio-separation package used by the
-default voice-only mode:
+dependencies:
 
 ```powershell
-uv sync --extra music-separation --extra youtube-publishing
+uv sync --extra youtube-publishing
 ```
 
-The audio-separation extra includes PyTorch and ONNX Runtime. The selected
-vocal-separation model (about 53 MB) downloads on first use and is cached under
-`%LOCALAPPDATA%`. Audio processing runs locally; stream audio is not uploaded.
+Voice-only audio separation is disabled by default to avoid slowing down clip
+creation. To enable it, install the optional CPU audio-separation package with
+`uv sync --extra music-separation --extra youtube-publishing` and set
+`VOICE_ONLY_AUDIO = True` in `live_clipper.py`. The model downloads on first use.
 
 Create a Groq API key in GroqCloud, then store it in the project-root `.env`
 file (which is ignored by Git):
@@ -69,7 +69,7 @@ GROQ_API_KEY=your-groq-key-goes-here
 Load `.env` when launching with `uv`:
 
 ```powershell
-uv run --extra music-separation --extra youtube-publishing --env-file .env python .\live_clipper.py
+uv run --extra youtube-publishing --env-file .env python .\live_clipper.py
 ```
 
 The variable name must be exactly `GROQ_API_KEY`. Do not share or commit your
@@ -124,10 +124,10 @@ server. On another container host, use the included `Dockerfile` and attach a
 persistent disk at `/app/data`.
 
 Clips, temporary stream segments, and model/token files need persistent disk
-storage. The first run may download Whisper and audio-separation models. The
-current YouTube OAuth flow is designed for a desktop browser; hosted YouTube
-publishing requires a web-based OAuth callback setup in addition to the
-dashboard.
+storage. The first run may download the Whisper model; audio-separation models
+are only downloaded if voice-only processing is enabled. The current YouTube
+OAuth flow is designed for a desktop browser; hosted YouTube publishing
+requires a web-based OAuth callback setup in addition to the dashboard.
 
 ## Review and publishing
 
@@ -155,19 +155,20 @@ Direct Instagram publishing requires a Professional account linked to a
 Facebook Page and publicly reachable video hosting.
 
 Voice-only processing is best-effort music-vocal separation, not a reliable
-music detector or speech-versus-game-audio separator. It is applied to every
-clip when `VOICE_ONLY_AUDIO` is enabled. It may suppress game sound effects or
-leave sung vocals in the output, and it cannot guarantee a clip will avoid a
-copyright claim. For reliable results, capture a separate streamer microphone
-track at the source and use only audio you have permission to publish.
+music detector or speech-versus-game-audio separator. It is disabled by default;
+when enabled, it is applied to every clip and can take several minutes. It may
+suppress game sound effects or leave sung vocals in the output, and it cannot
+guarantee a clip will avoid a copyright claim. For reliable results, capture a
+separate streamer microphone track at the source and use only audio you have
+permission to publish.
 
-Vertical exports crop gameplay to a wider 3:4 view and place it in a 1080x1920
-portrait frame with 240-pixel black margins above and below. The facecam stays
-at the same top-right position. Adjust `GAMEPLAY_CROP_RATIO` in `live_clipper.py`
-to tune the zoom; the default is 0.75. Captions are burned only when Whisper
-detects English and the transcript contains no Devanagari text. Other-language
-speech remains available in the transcript and metadata but does not get burned
-captions.
+Vertical exports place the enlarged streamer view across the top 540 pixels and
+fill the rest of the 1080x1920 portrait frame with gameplay. Adjust
+`STREAMER_PANEL_HEIGHT` to change the split and `GAMEPLAY_CROP_RATIO` to tune the
+gameplay zoom; the default crop ratio is 0.75. Captions are burned only when
+Whisper detects English and the transcript contains no Devanagari text.
+Other-language speech remains available in the transcript and metadata but does
+not get burned captions.
 Automatic facecam detection samples
 the clip and looks for a stable face position; its small YuNet model downloads
 from OpenCV Zoo on first use and is cached under `%LOCALAPPDATA%`. If detection
@@ -178,7 +179,9 @@ the crop constants in `live_clipper.py` when needed. Set
 `FACECAM_AUTO_DETECT = False` to disable detection. Exports use high-quality
 Lanczos scaling and H.264 CRF 18. Captions are white, bold, outlined, and
 bottom-centered with a margin intended to keep them clear of typical player
-controls.
+controls. H.264 encoding uses the `veryfast` preset to reduce render time. If
+Whisper transcription takes longer than 30 seconds, the clip is still rendered
+without captions or transcript metadata.
 
 ## Configuration
 
@@ -194,14 +197,14 @@ Edit the constants near the top of `live_clipper.py`:
 - `COOLDOWN_PERIOD`: minimum seconds between spike triggers (10 seconds by default)
 - `MAX_CLIPS_PER_RUN`: maximum clip attempts before the app stops (currently `5`)
 - `WHISPER_MODEL_SIZE`: `small` or `base`
-- `VOICE_ONLY_AUDIO`: enable best-effort local vocal-stem processing
+- `TRANSCRIPTION_TIMEOUT_SECONDS`: wait before rendering without captions (30 seconds by default)
+- `VOICE_ONLY_AUDIO`: optionally enable best-effort local vocal-stem processing (disabled by default)
 - `VOICE_STEM_MODEL`: audio-separation model used for the vocal stem
 - `GAMEPLAY_CROP_FOCUS_X`: horizontal gameplay focus, from `0` (left) to `1` (right)
 - `GAMEPLAY_CROP_RATIO`: gameplay crop width divided by its height; larger values zoom out slightly
+- `STREAMER_PANEL_HEIGHT`: height in pixels of the top streamer panel in the vertical export
 - `FACECAM_AUTO_DETECT`: locate a stable face position before cropping
 - `FACECAM_CROP_X`, `FACECAM_CROP_Y`, `FACECAM_CROP_WIDTH`, `FACECAM_CROP_HEIGHT`: normalized facecam rectangle in the landscape source
-- `FACECAM_OUTPUT_WIDTH`: facecam inset width in output pixels
-- `FACECAM_MARGIN`: inset distance from the top and right edges in pixels
 - `GROQ_API_KEY`: preferably stored in the ignored `.env` file
 - `GROQ_MODEL`: optional Groq model ID (defaults to `openai/gpt-oss-20b`)
 
@@ -215,5 +218,5 @@ baseline; the ratio is unavailable until prior chat messages establish a baselin
 Run the focused tests with:
 
 ```powershell
-uv run --extra music-separation python -m unittest -v
+uv run python -m unittest -v
 ```

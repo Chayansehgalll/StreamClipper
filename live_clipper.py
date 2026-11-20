@@ -2,9 +2,9 @@
 
 Quick start:
     1. Install FFmpeg and Streamlink, and ensure both are on PATH.
-    2. Install Python dependencies: uv sync --extra music-separation
+    2. Install Python dependencies: uv sync
     3. Set GROQ_API_KEY in the project .env file.
-    4. Run: uv run --extra music-separation --env-file .env python live_clipper.py
+    4. Run: uv run --env-file .env python live_clipper.py
     5. Open the dashboard and enter the stream URL to start clipping.
 
 Only use this with streams you own or are authorized to capture and republish.
@@ -50,23 +50,23 @@ CLIP_DURATION = 46
 CLIP_PRE_ROLL_SECONDS = 10
 COOLDOWN_PERIOD = 10
 WHISPER_MODEL_SIZE = "small"  # "small" or "base"
+TRANSCRIPTION_TIMEOUT_SECONDS = 15
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 
 SEGMENT_SECONDS = 1
 MAX_CONCURRENT_CLIPS = 2
 MAX_CLIPS_PER_RUN = 5
-VOICE_ONLY_AUDIO = True
+VOICE_ONLY_AUDIO = False
 VOICE_STEM_MODEL = "UVR_MDXNET_KARA_2.onnx"
 GAMEPLAY_CROP_FOCUS_X = 0.5
 GAMEPLAY_CROP_RATIO = 0.75
+STREAMER_PANEL_HEIGHT = 540
 FACECAM_AUTO_DETECT = True
 FACECAM_CROP_X = 0.70
 FACECAM_CROP_Y = 0.68
 FACECAM_CROP_WIDTH = 0.30
 FACECAM_CROP_HEIGHT = 0.32
-FACECAM_OUTPUT_WIDTH = 480
-FACECAM_MARGIN = 40
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("STREAMCLIPPER_DATA_DIR", str(ROOT_DIR))).resolve()
 TEMP_DIR = DATA_DIR / "temp"
@@ -1051,6 +1051,8 @@ async def render_vertical(
         raise ConfigurationError("GAMEPLAY_CROP_FOCUS_X must be between 0 and 1.")
     if not 9 / 16 <= GAMEPLAY_CROP_RATIO <= 1:
         raise ConfigurationError("GAMEPLAY_CROP_RATIO must be between 9/16 and 1.")
+    if not 0 < STREAMER_PANEL_HEIGHT < 1920 or STREAMER_PANEL_HEIGHT % 2:
+        raise ConfigurationError("STREAMER_PANEL_HEIGHT must be an even number between 1 and 1919.")
     if (
         FACECAM_CROP_X < 0
         or FACECAM_CROP_Y < 0
@@ -1077,21 +1079,22 @@ async def render_vertical(
         )
     facecam_x, facecam_y, facecam_width, facecam_height = facecam_crop
     gameplay_height = round(1080 / GAMEPLAY_CROP_RATIO)
-    gameplay_vertical_margin = (1920 - gameplay_height) // 2
+    gameplay_panel_height = 1920 - STREAMER_PANEL_HEIGHT
 
     filters = [
         "[0:v]split=2[gamesrc][facesrc]",
         (
             "[gamesrc]crop=ih*"
             f"{GAMEPLAY_CROP_RATIO}:ih:(iw-ow)*{GAMEPLAY_CROP_FOCUS_X}:0,"
-            f"scale=1080:{gameplay_height}:flags=lanczos[gamefit]"
+            f"scale=1080:{gameplay_height}:flags=lanczos,"
+            f"crop=1080:{gameplay_panel_height}[gamefit]"
         ),
         (
             "[facesrc]crop="
             f"iw*{facecam_width}:ih*{facecam_height}:"
             f"iw*{facecam_x}:ih*{facecam_y},"
-            "pad=iw+12:ih+12:6:6:color=white,"
-            f"scale={FACECAM_OUTPUT_WIDTH}:-2:flags=lanczos[face]"
+            f"scale=1080:{STREAMER_PANEL_HEIGHT}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop=1080:{STREAMER_PANEL_HEIGHT}[face]"
         ),
     ]
     gameplay = "[gamefit]"
@@ -1107,13 +1110,7 @@ async def render_vertical(
             f"force_style='{force_style}'[gamecaptioned]"
         )
         gameplay = "[gamecaptioned]"
-    filters.append(
-        f"{gameplay}pad=1080:1920:0:{gameplay_vertical_margin}:color=black[game]"
-    )
-    filters.append(
-        f"[game][face]overlay=W-w-{FACECAM_MARGIN}:{FACECAM_MARGIN}:"
-        "shortest=1,format=yuv420p[vout]"
-    )
+    filters.append(f"[face]{gameplay}vstack=inputs=2,format=yuv420p[vout]")
     filter_graph = ";".join(filters)
     input_args = ["-i", str(raw_clip)]
     audio_map = "0:a?"
@@ -1137,7 +1134,7 @@ async def render_vertical(
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "veryfast",
             "-crf",
             "18",
             "-pix_fmt",
@@ -1394,6 +1391,7 @@ class ClipPipeline:
             final_file = OUTPUT_DIR / f"{stem}.mp4"
             metadata_file = OUTPUT_DIR / f"{stem}.json"
             voice_audio: Path | None = None
+            transcription_task: asyncio.Task[tuple[list[CaptionWord], str]] | None = None
             clip_completed = False
 
             try:
@@ -1408,7 +1406,22 @@ class ClipPipeline:
                 else:
                     transcription_audio = voice_audio or raw_clip
                     report_progress("Transcribing speech…")
-                    words, transcript = await self.transcriber.transcribe(transcription_audio)
+                    transcription_task = asyncio.create_task(
+                        self.transcriber.transcribe(transcription_audio)
+                    )
+                    try:
+                        words, transcript = await asyncio.wait_for(
+                            asyncio.shield(transcription_task),
+                            timeout=TRANSCRIPTION_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        LOGGER.warning(
+                            "Speech transcription exceeded %g seconds; continuing without "
+                            "captions or transcript metadata.",
+                            TRANSCRIPTION_TIMEOUT_SECONDS,
+                        )
+                        report_progress("Transcription timed out; continuing without captions…")
+                        words, transcript = [], ""
                 subtitle_text = format_subtitles(words)
                 if not subtitle_text:
                     if not transcript.strip():
@@ -1454,6 +1467,22 @@ class ClipPipeline:
                 LOGGER.exception("Clip processing failed for %s.", stem)
                 raise
             finally:
+                if transcription_task is not None and not transcription_task.done():
+                    _DEFERRED_CLEANUP_PATHS.add(raw_clip)
+
+                    def transcription_finished(
+                        task: asyncio.Task[tuple[list[CaptionWord], str]],
+                    ) -> None:
+                        if not task.cancelled():
+                            error = task.exception()
+                            if error is not None:
+                                LOGGER.error(
+                                    "Transcription failed after the clip stopped waiting: %s",
+                                    error,
+                                )
+                        _cleanup_temporary_files((raw_clip,), deferred=True)
+
+                    transcription_task.add_done_callback(transcription_finished)
                 if not clip_completed:
                     _cleanup_temporary_files(
                         (
@@ -1635,7 +1664,10 @@ async def monitor_chat(
                 )
                 publish_clip_progress()
 
-                async def create_spike_clip() -> None:
+                async def create_spike_clip(
+                    clip_number: int,
+                    wait_seconds: int,
+                ) -> None:
                     try:
                         if progress_callback is None:
                             if stop_event is None:
@@ -1692,7 +1724,7 @@ async def monitor_chat(
                     CHAT_WINDOW_SECONDS,
                     threshold,
                 )
-                task = asyncio.create_task(create_spike_clip())
+                task = asyncio.create_task(create_spike_clip(clip_number, wait_seconds))
                 tasks.add(task)
                 clips_started += 1
                 task.add_done_callback(completed)

@@ -8,7 +8,7 @@ COPY pyproject.toml uv.lock ./
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential ffmpeg libglib2.0-0 libgomp1 \
-    && uv sync --frozen --no-dev --extra music-separation --extra youtube-publishing \
+    && uv sync --frozen --no-dev --extra youtube-publishing \
     && apt-get purge -y --auto-remove build-essential \
     && rm -rf /var/lib/apt/lists/*
 

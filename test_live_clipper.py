@@ -292,7 +292,7 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
         face_detection.start()
         self.addCleanup(face_detection.stop)
 
-    async def test_portrait_render_fills_frame_with_gameplay_and_facecam_overlay(self):
+    async def test_portrait_render_stacks_streamer_above_gameplay(self):
         with patch("live_clipper.run_command", new_callable=AsyncMock) as run_command:
             await render_vertical(Path("raw.mp4"), None, Path("final.mp4"))
 
@@ -300,13 +300,15 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
         filter_graph = command[command.index("-filter_complex") + 1]
         self.assertIn("split=2[gamesrc][facesrc]", filter_graph)
         self.assertIn("crop=ih*0.75:ih:(iw-ow)*0.5:0", filter_graph)
-        self.assertIn("scale=1080:1440:flags=lanczos", filter_graph)
-        self.assertIn("pad=1080:1920:0:240:color=black[game]", filter_graph)
+        self.assertIn("scale=1080:1440:flags=lanczos,crop=1080:1380[gamefit]", filter_graph)
         self.assertIn("crop=iw*0.3:ih*0.32:iw*0.7:ih*0.68", filter_graph)
-        self.assertIn("overlay=W-w-40:40", filter_graph)
+        self.assertIn("scale=1080:540:force_original_aspect_ratio=increase:flags=lanczos", filter_graph)
+        self.assertIn("[face][gamefit]vstack=inputs=2,format=yuv420p[vout]", filter_graph)
+        self.assertNotIn("overlay=", filter_graph)
         self.assertNotIn("subtitles=", filter_graph)
         self.assertIn("[vout]", command)
         self.assertNotIn("0:v:0", command)
+        self.assertEqual(command[command.index("-preset") + 1], "veryfast")
 
     async def test_portrait_render_uses_detected_facecam_position(self):
         with (
@@ -347,8 +349,7 @@ class RenderTests(unittest.IsolatedAsyncioTestCase):
         filter_graph = command[command.index("-filter_complex") + 1]
         self.assertIn("[gamefit]subtitles=filename=", filter_graph)
         self.assertIn("[gamecaptioned]", filter_graph)
-        self.assertIn("[gamecaptioned]pad=1080:1920:0:240:color=black[game]", filter_graph)
-        self.assertIn("[game][face]overlay=", filter_graph)
+        self.assertIn("[face][gamecaptioned]vstack=inputs=2,format=yuv420p[vout]", filter_graph)
 
 
 class MetadataTests(unittest.TestCase):
@@ -789,6 +790,78 @@ class ClipLimitTests(unittest.IsolatedAsyncioTestCase):
             any(message.endswith("Cutting the clip…") for message in progress_messages)
         )
 
+    async def test_completed_clip_does_not_clear_another_clips_progress(self):
+        class FakeReader:
+            calls = 0
+
+            def start(self):
+                pass
+
+            async def next_event(self):
+                self.calls += 1
+                if self.calls == 3:
+                    await asyncio.sleep(0.02)
+                return "message", {"timestamp": time.time()}
+
+            def stop(self):
+                pass
+
+        class FakeCapture:
+            async def has_full_buffer(self):
+                return True
+
+            def stop(self):
+                pass
+
+        class FakePipeline:
+            def __init__(self):
+                self.started = 0
+                self.both_started = asyncio.Event()
+                self.release_first = asyncio.Event()
+                self.release_second = asyncio.Event()
+
+            async def create_clip(self, progress_callback=None):
+                self.started += 1
+                clip_index = self.started
+                progress_callback(f"Processing clip {clip_index}")
+                if self.started == 2:
+                    self.both_started.set()
+                release = self.release_first if clip_index == 1 else self.release_second
+                await release.wait()
+
+        reader = FakeReader()
+        pipeline = FakePipeline()
+        progress_messages = []
+        settings = ClipSettings(
+            chat_spike_multiplier=1,
+            clip_duration=1,
+            clip_pre_roll_seconds=0,
+            max_clips=2,
+            min_chat_messages=2,
+            cooldown_seconds=0,
+        )
+        with patch("live_clipper.CHAT_WINDOW_SECONDS", 0.01):
+            task = asyncio.create_task(
+                monitor_chat(
+                    reader,
+                    pipeline,
+                    FakeCapture(),
+                    settings,
+                    progress_callback=progress_messages.append,
+                )
+            )
+            try:
+                await asyncio.wait_for(pipeline.both_started.wait(), timeout=2)
+                pipeline.release_first.set()
+                await asyncio.sleep(0.01)
+                self.assertIn("Clip 2: Processing clip 2", progress_messages[-1])
+                self.assertNotIn("Clip 1:", progress_messages[-1])
+            finally:
+                pipeline.release_first.set()
+                pipeline.release_second.set()
+                if not task.done():
+                    await asyncio.wait_for(task, timeout=2)
+
     async def test_stops_after_configured_number_of_clip_triggers(self):
         class FakeReader:
             stopped = False
@@ -992,6 +1065,59 @@ class ChatSpikeTests(unittest.TestCase):
 
 
 class SilentClipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transcription_timeout_still_renders_clip_and_defers_raw_cleanup(self):
+        class FakeCapture:
+            async def create_raw_clip(self, destination):
+                destination.write_bytes(b"raw")
+
+        class BlockingTranscriber:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+                self.audio_path = None
+
+            async def transcribe(self, audio_path):
+                self.audio_path = audio_path
+                self.started.set()
+                await self.release.wait()
+                return [], ""
+
+        transcriber = BlockingTranscriber()
+        pipeline = ClipPipeline(
+            FakeCapture(),
+            transcriber,
+            SimpleNamespace(generate=AsyncMock()),
+            "creator",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("live_clipper.TEMP_DIR", root / "temp"),
+                patch("live_clipper.OUTPUT_DIR", root / "output"),
+                patch("live_clipper.TRANSCRIPTION_TIMEOUT_SECONDS", 0.01),
+                patch("live_clipper.render_vertical", new_callable=AsyncMock) as render,
+            ):
+                await pipeline.create_clip()
+                await asyncio.wait_for(transcriber.started.wait(), timeout=1)
+
+                raw_clip = transcriber.audio_path
+                self.assertTrue(raw_clip.exists())
+                self.assertIsNone(render.await_args.args[1])
+                self.assertIsNone(render.await_args.args[3])
+                metadata_file = next((root / "output").glob("clip_*.json"))
+                self.assertEqual(
+                    json.loads(metadata_file.read_text(encoding="utf-8"))["transcript"],
+                    "",
+                )
+
+                transcriber.release.set()
+                for _ in range(100):
+                    if not raw_clip.exists():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertFalse(raw_clip.exists())
+
     async def test_cancelled_thread_work_defers_input_cleanup_until_worker_finishes(self):
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory) / "raw.mp4"
@@ -1149,6 +1275,41 @@ class SilentClipTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VoiceOnlyClipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_pipeline_skips_vocal_separation(self):
+        class FakeCapture:
+            async def create_raw_clip(self, destination):
+                destination.write_bytes(b"raw")
+
+        class FakeTranscriber:
+            audio_path = None
+
+            async def transcribe(self, audio_path):
+                self.audio_path = audio_path
+                return [], ""
+
+        separator = SimpleNamespace(isolate=AsyncMock())
+        transcriber = FakeTranscriber()
+        pipeline = ClipPipeline(
+            FakeCapture(),
+            transcriber,
+            SimpleNamespace(generate=AsyncMock()),
+            "creator",
+            separator,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch("live_clipper.TEMP_DIR", root / "temp"),
+                patch("live_clipper.OUTPUT_DIR", root / "output"),
+                patch("live_clipper.render_vertical", new_callable=AsyncMock) as render,
+            ):
+                await pipeline.create_clip()
+
+        separator.isolate.assert_not_awaited()
+        self.assertEqual(transcriber.audio_path, render.await_args.args[0])
+        self.assertIsNone(render.await_args.args[3])
+
     async def test_cancelling_voice_extraction_removes_partial_audio(self):
         extraction_started = asyncio.Event()
 
